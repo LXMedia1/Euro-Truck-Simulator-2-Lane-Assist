@@ -27,7 +27,52 @@ _was_path_lost = True  # Start as True so first path acquisition is also smoothe
 _path_reacquire_time = 0
 _path_reacquire_ramp_duration = 2.0  # seconds to ramp up steering after re-acquiring path
 _last_steering_value = 0
-_max_steering_change_rate = 150  # max degrees per second change in steering (only for large corrections)
+_last_steering_time = 0
+
+# Jerk limiting parameters (speed-adaptive)
+# These define max steering change rate at different speeds
+_jerk_limit_low_speed = 300   # degrees/s at low speed (10 kph) - more responsive
+_jerk_limit_high_speed = 100  # degrees/s at high speed (80 kph) - smoother
+
+
+def _get_jerk_limit(speed_kph: float) -> float:
+    """Get the maximum steering change rate based on current speed.
+    Higher speeds = lower jerk limit = smoother steering.
+    """
+    speed_kph = max(10, min(80, speed_kph))  # Clamp to 10-80 kph
+    # Linear interpolation between low and high speed jerk limits
+    t = (speed_kph - 10) / 70  # 0 at 10kph, 1 at 80kph
+    return _jerk_limit_low_speed + t * (_jerk_limit_high_speed - _jerk_limit_low_speed)
+
+
+def _apply_jerk_limiting(raw_steering: float, speed_kph: float) -> float:
+    """Apply jerk limiting to prevent sudden steering changes.
+    This makes the steering feel more humanlike and smooth.
+    """
+    global _last_steering_value, _last_steering_time
+
+    current_time = time.perf_counter()
+    dt = current_time - _last_steering_time
+
+    # Handle first call or large time gaps
+    if _last_steering_time == 0 or dt > 0.5:
+        _last_steering_time = current_time
+        _last_steering_value = raw_steering
+        return raw_steering
+
+    # Get speed-adaptive jerk limit
+    jerk_limit = _get_jerk_limit(speed_kph)
+    max_change = jerk_limit * dt
+
+    # Clamp the steering change
+    steering_change = raw_steering - _last_steering_value
+    clamped_change = np.clip(steering_change, -max_change, max_change)
+    smoothed_steering = _last_steering_value + clamped_change
+
+    _last_steering_time = current_time
+    _last_steering_value = smoothed_steering
+
+    return smoothed_steering
 
 
 def get_closest_route_item(items: list[rc.RouteItem]):
@@ -434,8 +479,11 @@ def GetSteering():
                 ramp_factor = 1 - pow(-2 * ramp_factor + 2, 2) / 2
             raw_steering = raw_steering * ramp_factor
 
-        _last_steering_value = raw_steering
-        return raw_steering
+        # Apply jerk limiting for smooth, humanlike steering
+        speed_kph = data.truck_speed * 3.6
+        smoothed_steering = _apply_jerk_limiting(raw_steering, speed_kph)
+
+        return smoothed_steering
     except Exception:
         logging.exception("Error in GetSteering")
         _was_path_lost = True

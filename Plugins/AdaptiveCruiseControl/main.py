@@ -144,7 +144,7 @@ class Plugin(ETS2LAPlugin):
     last_time = time.time()
 
     # Control smoothing
-    output_smoothing_factor = 0.6  # Lower value = smoother but slower response
+    output_smoothing_factor = 0.45  # Lower value = smoother but slower response (was 0.6)
     pid_sample_time = 0.05  # 50ms for PID cycle
 
     max_speed = SmoothedValue("time", 0.5)
