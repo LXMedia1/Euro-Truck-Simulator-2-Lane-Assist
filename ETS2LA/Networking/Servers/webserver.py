@@ -37,6 +37,7 @@ import traceback
 import threading
 import logging
 import requests
+from collections import deque
 import uvicorn
 import socket
 import json
@@ -44,7 +45,7 @@ import zlib
 import time
 
 asked_plugins = False  # Will trigger the "Do you want to re-enable plugins?" popup
-mainThreadQueue = []
+mainThreadQueue = deque()  # Use deque for O(1) popleft instead of O(n) list.remove()
 sessionToken = ""
 thread = None
 settings = GlobalSettings()

@@ -64,9 +64,8 @@ def run():
 
             # Execute all main thread commands from the webserver
             if webserver.mainThreadQueue:
-                func = webserver.mainThreadQueue[0]
+                func = webserver.mainThreadQueue.popleft()  # O(1) instead of O(n) remove
                 func[0](*func[1], **func[2])
-                webserver.mainThreadQueue.remove(func)
                 logging.debug(f"Executed queue item: {func[0].__name__}")
 
             if variables.CLOSE:

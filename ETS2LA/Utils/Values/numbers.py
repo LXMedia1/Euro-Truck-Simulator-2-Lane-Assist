@@ -1,11 +1,12 @@
 # type: ignore
 # TODO: Make this file type-safe.
-from typing import List, Literal, Tuple
+from typing import Literal, Tuple
+from collections import deque
 import time
 
 
 class SmoothedValue:
-    valueArray: List[float] | List[Tuple[int, float]]
+    valueArray: deque[float] | deque[Tuple[int, float]]
     smoothingType: Literal["frames", "time"]
     smoothingAmount: int | float
 
@@ -17,16 +18,18 @@ class SmoothedValue:
         self.smoothingType = smoothingType
         self.smoothingAmount = smoothingAmount
         if smoothingType == "frames":
-            self.valueArray = [0]
+            # deque with maxlen auto-discards oldest (O(1) vs O(n) for list.pop(0))
+            self.valueArray = deque([0], maxlen=int(smoothingAmount))
         elif smoothingType == "time":
-            self.valueArray = [[time.perf_counter(), 0]]
+            # Time-based: use deque for O(1) popleft(), no maxlen since it's time-based
+            self.valueArray = deque([[time.perf_counter(), 0]])
 
     def get(self):
         if self.smoothingType == "frames":
             return sum(self.valueArray) / len(self.valueArray)
         elif self.smoothingType == "time":
-            while self.valueArray[-1][0] - self.valueArray[0][0] > self.smoothingAmount:
-                self.valueArray.pop(0)
+            while len(self.valueArray) > 1 and self.valueArray[-1][0] - self.valueArray[0][0] > self.smoothingAmount:
+                self.valueArray.popleft()  # O(1) instead of O(n)
             if len(self.valueArray) == 0:
                 return 0
             return sum([v for t, v in self.valueArray]) / len(self.valueArray)
@@ -35,14 +38,12 @@ class SmoothedValue:
 
     def smooth(self, value):
         if self.smoothingType == "frames":
-            self.valueArray.append(value)
-            if len(self.valueArray) > self.smoothingAmount:
-                self.valueArray.pop(0)
+            self.valueArray.append(value)  # deque(maxlen) auto-discards oldest
             return sum(self.valueArray) / len(self.valueArray)
         elif self.smoothingType == "time":
             self.valueArray.append([time.perf_counter(), value])
-            while self.valueArray[-1][0] - self.valueArray[0][0] > self.smoothingAmount:
-                self.valueArray.pop(0)
+            while len(self.valueArray) > 1 and self.valueArray[-1][0] - self.valueArray[0][0] > self.smoothingAmount:
+                self.valueArray.popleft()  # O(1) instead of O(n)
             return sum([v for t, v in self.valueArray]) / len(self.valueArray)
         else:
             raise ValueError("Invalid smoothing type")

@@ -15,6 +15,7 @@ from ETS2LA.Events import Event
 from ETS2LA import variables
 
 from memory import create_shared_memory_pair, SharedMemorySender, SharedMemoryReceiver
+from collections import deque
 import multiprocessing
 import threading
 
@@ -128,9 +129,9 @@ class Plugin:
     file_times: dict[str, float]
     """The last modification times of the files the plugin wants to check."""
 
-    frametimes: list[float]
+    frametimes: deque[float]
     """
-    A list of all frametimes recorded by the plugin.
+    A deque of frametimes recorded by the plugin (maxlen=60).
     """
 
     pid: int
@@ -142,7 +143,7 @@ class Plugin:
         # First initialize / reset the variables
         self.stack = {}
         self.state = {"status": "", "progress": -1}
-        self.frametimes = []
+        self.frametimes = deque(maxlen=60)  # Auto-discards oldest when full (O(1))
         self.last_controls_state = {}
         self.stop = False
         self.running = False
@@ -494,9 +495,7 @@ class Plugin:
                     message = self.stack[Channel.FRAMETIME_UPDATE].popitem()[1]
                     if "frametime" in message.data:
                         frametime = message.data["frametime"]
-                        self.frametimes.append(frametime)
-                        if len(self.frametimes) > 60:
-                            self.frametimes.pop(0)
+                        self.frametimes.append(frametime)  # deque(maxlen=60) auto-discards oldest
 
             time.sleep(0.5)
 

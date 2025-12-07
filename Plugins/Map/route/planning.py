@@ -15,7 +15,7 @@ importlib.reload(rc)
 # Prefab route cache to avoid expensive recalculations
 # Key: (prefab_uid, end_point_hash) -> Value: (lane_ids, timestamp)
 _prefab_lane_cache: dict[tuple, tuple[list[int], float]] = {}
-_prefab_cache_ttl = 30.0  # Cache entries expire after 30 seconds
+_prefab_cache_ttl = 5.0  # Cache entries expire after 5 seconds (reduced from 30s to prevent stale routes)
 
 
 def _get_point_hash(point: c.Position) -> tuple:
