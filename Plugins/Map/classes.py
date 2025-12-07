@@ -20,6 +20,27 @@ import psutil
 
 # MARK: Constants
 
+# NavGraph debug logger - controlled by settings.NavGraphDebugLogging
+navgraph_logger = logging.getLogger("Map.NavGraph")
+
+def setup_navgraph_logging():
+    """Setup navgraph logger based on settings. Call this after settings are loaded."""
+    if settings.NavGraphDebugLogging:
+        navgraph_logger.setLevel(logging.DEBUG)
+        # Ensure we have a handler that shows DEBUG messages
+        if not navgraph_logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter('[%(levelname)s] %(message)s')
+            handler.setFormatter(formatter)
+            navgraph_logger.addHandler(handler)
+        navgraph_logger.info("[NavGraph] Debug logging ENABLED via settings.NavGraphDebugLogging")
+    else:
+        navgraph_logger.setLevel(logging.WARNING)  # Only show warnings and errors by default
+
+# Initialize with default level, will be updated when settings are checked
+navgraph_logger.setLevel(logging.WARNING)
+
 data = None
 """The data object that is used by classes here. Will be set once the MapData object is created and loaded."""
 auto_tolls = settings.AutoTolls
@@ -251,60 +272,128 @@ class NavigationEntry:
     def calculate_node_data(self, map_data):
         this = map_data.get_node_by_uid(self.uid)
         if this is None:
+            navgraph_logger.debug(f"[NavGraph] Node {self.uid}: SOURCE NODE NOT FOUND in map_data.nodes")
             return
+
+        navgraph_logger.debug(f"[NavGraph] Processing node {self.uid} at ({this.x:.1f}, {this.y:.1f}) - {len(self.forward)} forward, {len(self.backward)} backward connections")
+
         for node in self.forward:
             if node.node_id == self.uid:
+                navgraph_logger.debug(f"  [FWD] Skipping self-reference to {node.node_id}")
                 continue
 
             map_data.total += 1
             other = map_data.get_node_by_uid(node.node_id)
-            if other is None or other == this:
+            if other is None:
+                navgraph_logger.debug(f"  [FWD] Target node {node.node_id}: NOT FOUND in map_data.nodes")
                 continue
+            if other == this:
+                navgraph_logger.debug(f"  [FWD] Target node {node.node_id}: Same as source (skipping)")
+                continue
+
+            navgraph_logger.debug(f"  [FWD] {self.uid} -> {node.node_id}: Looking for connecting item...")
+            navgraph_logger.debug(f"       Source: fwd_item={this.forward_item_uid}, bwd_item={this.backward_item_uid}")
+            navgraph_logger.debug(f"       Target: fwd_item={other.forward_item_uid}, bwd_item={other.backward_item_uid}")
 
             node.item_uid = node_helpers.get_connecting_item_uid(this, other)
             if node.item_uid is None:
-                logging.debug(
-                    f"Failed to get connecting item UID for nodes {this.uid} and {other.uid}"
+                navgraph_logger.debug(
+                    f"  [FWD] {self.uid} -> {node.node_id}: NO CONNECTING ITEM FOUND"
+                    f"\n       Source items: fwd={this.forward_item_uid}, bwd={this.backward_item_uid}"
+                    f"\n       Target items: fwd={other.forward_item_uid}, bwd={other.backward_item_uid}"
                 )
                 map_data.not_found += 1
                 continue
 
+            navgraph_logger.debug(f"  [FWD] {self.uid} -> {node.node_id}: Found connecting item {node.item_uid}")
+
             item = map_data.get_item_by_uid(node.item_uid, warn_errors=False)
             if item is None:
+                navgraph_logger.warning(f"  [FWD] {self.uid} -> {node.node_id}: Item {node.item_uid} NOT FOUND in roads/prefabs")
                 continue
+
             node.item_type = type(item)
+            item_type_name = "Road" if isinstance(item, Road) else "Prefab" if isinstance(item, Prefab) else type(item).__name__
+            navgraph_logger.debug(f"  [FWD] {self.uid} -> {node.node_id}: Item is a {item_type_name}")
+
             node.lane_indices = node_helpers.get_connecting_lanes_by_item(
                 this, other, item, map_data
             )
             if node.lane_indices == []:
+                navgraph_logger.warning(
+                    f"  [FWD] {self.uid} -> {node.node_id}: NO LANES FOUND for {item_type_name} {node.item_uid}"
+                )
+                if isinstance(item, Road):
+                    navgraph_logger.debug(f"       Road info: start_node={item.start_node_uid}, end_node={item.end_node_uid}")
+                    navgraph_logger.debug(f"       Road look: {item.road_look.name if item.road_look else 'None'}")
+                    if item.road_look:
+                        navgraph_logger.debug(f"       Lanes: left={len(item.road_look.lanes_left)}, right={len(item.road_look.lanes_right)}")
+                elif isinstance(item, Prefab):
+                    navgraph_logger.debug(f"       Prefab token: {item.token}")
+                    navgraph_logger.debug(f"       Prefab nodes: {item.node_uids}")
+                    navgraph_logger.debug(f"       Origin index: {item.origin_node_index}")
                 map_data.lanes_invalid += 1
+            else:
+                navgraph_logger.debug(f"  [FWD] {self.uid} -> {node.node_id}: SUCCESS - lanes {node.lane_indices}")
 
         for node in self.backward:
             if node.node_id == self.uid:
+                navgraph_logger.debug(f"  [BWD] Skipping self-reference to {node.node_id}")
                 continue
 
             map_data.total += 1
             other = map_data.get_node_by_uid(node.node_id)
-            if other is None or other == this:
+            if other is None:
+                navgraph_logger.debug(f"  [BWD] Target node {node.node_id}: NOT FOUND in map_data.nodes")
                 continue
+            if other == this:
+                navgraph_logger.debug(f"  [BWD] Target node {node.node_id}: Same as source (skipping)")
+                continue
+
+            navgraph_logger.debug(f"  [BWD] {self.uid} -> {node.node_id}: Looking for connecting item...")
+            navgraph_logger.debug(f"       Source: fwd_item={this.forward_item_uid}, bwd_item={this.backward_item_uid}")
+            navgraph_logger.debug(f"       Target: fwd_item={other.forward_item_uid}, bwd_item={other.backward_item_uid}")
 
             node.item_uid = node_helpers.get_connecting_item_uid(this, other)
             if node.item_uid is None:
-                logging.debug(
-                    f"Failed to get connecting item UID for nodes {this.uid} and {other.uid}"
+                navgraph_logger.debug(
+                    f"  [BWD] {self.uid} -> {node.node_id}: NO CONNECTING ITEM FOUND"
+                    f"\n       Source items: fwd={this.forward_item_uid}, bwd={this.backward_item_uid}"
+                    f"\n       Target items: fwd={other.forward_item_uid}, bwd={other.backward_item_uid}"
                 )
                 map_data.not_found += 1
                 continue
 
+            navgraph_logger.debug(f"  [BWD] {self.uid} -> {node.node_id}: Found connecting item {node.item_uid}")
+
             item = map_data.get_item_by_uid(node.item_uid, warn_errors=False)
             if item is None:
+                navgraph_logger.warning(f"  [BWD] {self.uid} -> {node.node_id}: Item {node.item_uid} NOT FOUND in roads/prefabs")
                 continue
+
             node.item_type = type(item)
+            item_type_name = "Road" if isinstance(item, Road) else "Prefab" if isinstance(item, Prefab) else type(item).__name__
+            navgraph_logger.debug(f"  [BWD] {self.uid} -> {node.node_id}: Item is a {item_type_name}")
+
             node.lane_indices = node_helpers.get_connecting_lanes_by_item(
                 this, other, item, map_data
             )
             if node.lane_indices == []:
+                navgraph_logger.warning(
+                    f"  [BWD] {self.uid} -> {node.node_id}: NO LANES FOUND for {item_type_name} {node.item_uid}"
+                )
+                if isinstance(item, Road):
+                    navgraph_logger.debug(f"       Road info: start_node={item.start_node_uid}, end_node={item.end_node_uid}")
+                    navgraph_logger.debug(f"       Road look: {item.road_look.name if item.road_look else 'None'}")
+                    if item.road_look:
+                        navgraph_logger.debug(f"       Lanes: left={len(item.road_look.lanes_left)}, right={len(item.road_look.lanes_right)}")
+                elif isinstance(item, Prefab):
+                    navgraph_logger.debug(f"       Prefab token: {item.token}")
+                    navgraph_logger.debug(f"       Prefab nodes: {item.node_uids}")
+                    navgraph_logger.debug(f"       Origin index: {item.origin_node_index}")
                 map_data.lanes_invalid += 1
+            else:
+                navgraph_logger.debug(f"  [BWD] {self.uid} -> {node.node_id}: SUCCESS - lanes {node.lane_indices}")
 
 
 class Node:
@@ -3080,6 +3169,25 @@ class Prefab(BaseItem):
             self._nav_routes = valid_routes
 
     @property
+    def is_toll(self) -> bool:
+        """Check if this prefab is a toll station."""
+        if self.prefab_description is None:
+            return False
+        return "toll" in self.prefab_description.path.lower()
+
+    @property
+    def prefab_type(self) -> str:
+        """Get the prefab type from its path (e.g., 'toll', 'cross', 'gas', etc.)."""
+        if self.prefab_description is None:
+            return "unknown"
+        path = self.prefab_description.path.lower()
+        # Common prefab types in the path
+        for ptype in ["toll", "cross", "gas", "parking", "rest", "weigh", "border", "company"]:
+            if ptype in path:
+                return ptype
+        return "other"
+
+    @property
     def nav_routes(self) -> list[PrefabNavRoute]:
         """The prefab description also has nav routes, but this nav route list has the correct world space positions."""
         if not self._nav_routes:
@@ -3765,14 +3873,33 @@ class MapData:
     lanes_invalid = 0
 
     def compute_navigation_data(self):
+        # Setup logging based on settings
+        setup_navgraph_logging()
+
         amount = len(self.navigation)
         count = 0
+
+        # Reset counters
+        self.total = 0
+        self.not_found = 0
+        self.lanes_invalid = 0
+
+        navgraph_logger.info(f"[NavGraph] Starting navigation graph computation for {amount} navigation entries")
+        navgraph_logger.info(f"[NavGraph] Available data: {len(self.nodes)} nodes, {len(self.roads)} roads, {len(self.prefabs)} prefabs")
+
+        computation_start = time.time()
+        slow_nodes = []
+
         for node in self.navigation:
             start_time = time.time()
             node.calculate_node_data(self)
             end_time = time.time()
-            if end_time - start_time > 0.1:
-                print(f"Node {node.uid} took {end_time - start_time:.2f}s to calculate")
+            elapsed = end_time - start_time
+
+            if elapsed > 0.1:
+                slow_nodes.append((node.uid, elapsed))
+                print(f"Node {node.uid} took {elapsed:.2f}s to calculate")
+
             if count % 5000 == 0:
                 print(
                     f"Processed {count}/{amount} nodes ({count / amount * 100:.2f}%)",
@@ -3780,15 +3907,41 @@ class MapData:
                 )
             count += 1
 
+        computation_time = time.time() - computation_start
+
+        # Summary statistics
+        successful = self.total - self.not_found - self.lanes_invalid
+        success_rate = (successful / self.total * 100) if self.total > 0 else 0
+        not_found_rate = (self.not_found / self.total * 100) if self.total > 0 else 0
+        lanes_invalid_rate = (self.lanes_invalid / self.total * 100) if self.total > 0 else 0
+
         print(
-            f"         > Item missing: {self.not_found} ({self.not_found / self.total * 100:.2f}%)                      "
+            f"         > Item missing: {self.not_found} ({not_found_rate:.2f}%)                      "
         )
         print(
-            f"         > Lanes empty: {self.lanes_invalid} ({self.lanes_invalid / self.total * 100:.2f}%)"
+            f"         > Lanes empty: {self.lanes_invalid} ({lanes_invalid_rate:.2f}%)"
         )
         print(
-            f"         > Successful: {self.total - self.not_found - self.lanes_invalid} ({(self.total - self.not_found - self.lanes_invalid) / self.total * 100:.2f}%)"
+            f"         > Successful: {successful} ({success_rate:.2f}%)"
         )
+
+        # Detailed logging summary
+        navgraph_logger.info(f"[NavGraph] ========== COMPUTATION COMPLETE ==========")
+        navgraph_logger.info(f"[NavGraph] Time: {computation_time:.2f}s for {amount} entries")
+        navgraph_logger.info(f"[NavGraph] Total connections processed: {self.total}")
+        navgraph_logger.info(f"[NavGraph] Results:")
+        navgraph_logger.info(f"[NavGraph]   - Successful:    {successful:>6} ({success_rate:.2f}%)")
+        navgraph_logger.info(f"[NavGraph]   - Item missing:  {self.not_found:>6} ({not_found_rate:.2f}%)")
+        navgraph_logger.info(f"[NavGraph]   - Lanes invalid: {self.lanes_invalid:>6} ({lanes_invalid_rate:.2f}%)")
+
+        if slow_nodes:
+            navgraph_logger.warning(f"[NavGraph] {len(slow_nodes)} slow nodes detected (>0.1s):")
+            for node_uid, elapsed in slow_nodes[:10]:  # Show first 10
+                navgraph_logger.warning(f"[NavGraph]   Node {node_uid}: {elapsed:.2f}s")
+            if len(slow_nodes) > 10:
+                navgraph_logger.warning(f"[NavGraph]   ... and {len(slow_nodes) - 10} more")
+
+        navgraph_logger.info(f"[NavGraph] ============================================")
 
     def export_road_offsets(self):
         if not data.export_road_offsets:

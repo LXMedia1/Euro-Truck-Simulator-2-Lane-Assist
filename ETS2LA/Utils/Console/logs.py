@@ -32,13 +32,13 @@ def CountErrorsAndWarnings(folder="logs"):
                 if errors != 0 or warnings != 0:
                     count += 1
                     print()
-                    print(f"{DARK_GRAY}┌─── {file}{END}")
+                    print(f"{DARK_GRAY}+--- {file}{END}")
                 if errors != 0:
-                    print(f"{DARK_GRAY}│{RED} {_('Errors: ')} {errors} {END}")
+                    print(f"{DARK_GRAY}|{RED} {_('Errors: ')} {errors} {END}")
                 if warnings != 0:
-                    print(f"{DARK_GRAY}│{YELLOW} {_('Warnings: ')} {warnings} {END}")
+                    print(f"{DARK_GRAY}|{YELLOW} {_('Warnings: ')} {warnings} {END}")
                 if errors != 0 or warnings != 0:
-                    print(f"{DARK_GRAY}└───{END}")
+                    print(f"{DARK_GRAY}+---{END}")
 
     if count == 0:
         print(f"{GREEN}{_('No errors or warnings found.')}{END}")

@@ -21,6 +21,8 @@ class Settings(ETS2LASettings):
     TakeoverWhenUnreliable: bool = True
     traffic_side: Literal["Right Handed", "Left Handed"] = "Right Handed"
     AutoTolls: bool = False
+    NavGraphDebugLogging: bool = False
+    """Enable detailed debug logging for navgraph building. Logs will show connection failures, lane issues, etc."""
 
 
 settings = Settings("Map")

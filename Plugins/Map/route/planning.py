@@ -628,6 +628,11 @@ def GetNextNavigationItem():
 
     if isinstance(next_item, c.Prefab):
         accepted_lanes = current.lanes
+        # Filter out invalid lane indices that exceed nav_routes bounds
+        max_lane_index = len(next_item.nav_routes) - 1
+        accepted_lanes = [lane for lane in accepted_lanes if 0 <= lane <= max_lane_index]
+        if not accepted_lanes:
+            return None  # No valid lanes to navigate
         best_lane = math.inf
         best_distance = math.inf
         best_length = math.inf
@@ -676,17 +681,57 @@ def ResetState():
 was_indicating = False
 
 
+import Plugins.Map.utils.lane_safety as lane_safety
+
+# Lane change state for planning (navigation mode)
+_planning_pending_lane_change = False
+_planning_target_index = None
+_planning_last_lane_change_time = 0
+_planning_lane_change_cooldown = 2.0
+
+
 def CheckForLaneChangeManual():
-    global was_indicating
+    global was_indicating, _planning_pending_lane_change, _planning_target_index, _planning_last_lane_change_time
+
     if isinstance(data.route_plan[0].items[0].item, c.Prefab):
         was_indicating = False
+        _planning_pending_lane_change = False
+        _planning_target_index = None
+        data.lane_change_speed_factor = 1.0
         return
 
     current_index = data.route_plan[0].lane_index
-    lanes = data.route_plan[0].items[0].item.lanes
+    road = data.route_plan[0].items[0].item
+    lanes = road.lanes
     side = lanes[current_index].side
     left_lanes = len([lane for lane in lanes if lane.side == "left"])
-    # lanes = left_lanes + right_lanes
+
+    import time
+    current_time = time.perf_counter()
+
+    # Check cooldown
+    if current_time - _planning_last_lane_change_time < _planning_lane_change_cooldown:
+        return
+
+    # Check pending lane change
+    if _planning_pending_lane_change and _planning_target_index is not None:
+        is_safe, speed_factor = lane_safety.check_lane_safety(
+            _planning_target_index, current_index, road
+        )
+        if is_safe:
+            target_index = _planning_target_index
+            data.route_plan[0].skip_indicate_state = True
+            data.route_plan[0].lane_index = target_index
+            data.route_plan[0].skip_indicate_state = False
+            data.route_plan = [data.route_plan[0]]
+            _planning_pending_lane_change = False
+            _planning_target_index = None
+            _planning_last_lane_change_time = current_time
+            data.lane_change_speed_factor = 1.0
+            logging.info(f"[Navigation] Lane change executed: {current_index} -> {target_index}")
+        else:
+            data.lane_change_speed_factor = speed_factor
+        return
 
     if (
         data.truck_indicating_right or data.truck_indicating_left
@@ -729,13 +774,32 @@ def CheckForLaneChangeManual():
         if target_index >= len(lanes):
             target_index = len(lanes) - 1
 
-        data.route_plan[0].skip_indicate_state = True
-        data.route_plan[0].lane_index = target_index
-        data.route_plan[0].skip_indicate_state = False
-        data.route_plan = [data.route_plan[0]]
+        # Check if lane change is safe
+        is_safe, speed_factor = lane_safety.check_lane_safety(
+            target_index, current_index, road
+        )
+
+        if is_safe:
+            data.route_plan[0].skip_indicate_state = True
+            data.route_plan[0].lane_index = target_index
+            data.route_plan[0].skip_indicate_state = False
+            data.route_plan = [data.route_plan[0]]
+            data.lane_change_speed_factor = 1.0
+            _planning_last_lane_change_time = current_time
+            logging.info(f"[Navigation] Lane change executed immediately: {current_index} -> {target_index}")
+        else:
+            _planning_pending_lane_change = True
+            _planning_target_index = target_index
+            data.lane_change_speed_factor = speed_factor
+            logging.info(f"[Navigation] Lane change pending: {current_index} -> {target_index}, waiting for safe gap")
 
     elif not data.truck_indicating_left and not data.truck_indicating_right:
         was_indicating = False
+        if _planning_pending_lane_change:
+            _planning_pending_lane_change = False
+            _planning_target_index = None
+            data.lane_change_speed_factor = 1.0
+            lane_safety.reset_lane_change_state()
 
 
 def CheckForLaneChange():
@@ -780,6 +844,25 @@ def UpdateRoutePlan():
                 data.route_plan = []
             return  # No route sections found
 
+        # Check if we're too far from current route - force re-search
+        # BUT skip this check if indicating or lane changing (truck will naturally move away during lane change)
+        is_indicating = data.truck_indicating_left or data.truck_indicating_right
+        is_lane_changing = data.route_plan[0].is_lane_changing if data.route_plan[0] else False
+        if len(data.route_plan) > 0 and data.route_plan[0] is not None and not is_indicating and not is_lane_changing:
+            try:
+                points = data.route_plan[0].get_points()
+                current_item = data.route_plan[0].items[0].item
+                # Use lower threshold for toll stations (they need precise navigation)
+                threshold = 15 if isinstance(current_item, c.Prefab) and current_item.is_toll else 30
+                if len(points) > 0:
+                    first_dist = math_helpers.DistanceBetweenPoints(
+                        (points[0].x, points[0].z), (data.truck_x, data.truck_z)
+                    )
+                    if first_dist > threshold:  # Too far - force re-search
+                        data.route_plan = [GetClosestRouteSection()]
+            except Exception:
+                pass
+
         if data.route_plan[0].is_ended:
             data.route_plan.pop(0)
 
@@ -817,6 +900,28 @@ def UpdateRoutePlan():
             else:
                 data.route_plan = []
             return
+
+        # Check if we're too far from current route - force navigation recalc
+        # BUT skip this check if indicating or lane changing (truck will naturally move away during lane change)
+        is_indicating = data.truck_indicating_left or data.truck_indicating_right
+        is_lane_changing = data.route_plan[0].is_lane_changing if data.route_plan[0] else False
+        if len(data.route_plan) > 0 and data.route_plan[0] is not None and not is_indicating and not is_lane_changing:
+            try:
+                points = data.route_plan[0].get_points()
+                current_item = data.route_plan[0].items[0].item
+                # Use lower threshold for toll stations (they need precise navigation)
+                threshold = 15 if isinstance(current_item, c.Prefab) and current_item.is_toll else 30
+                if len(points) > 0:
+                    first_dist = math_helpers.DistanceBetweenPoints(
+                        (points[0].x, points[0].z), (data.truck_x, data.truck_z)
+                    )
+                    if first_dist > threshold:  # Too far - force recalc
+                        data.update_navigation_plan = True
+                        first_item = GetCurrentNavigationPlan()
+                        if first_item is not None:
+                            data.route_plan = [first_item]
+            except Exception:
+                pass
 
         if data.route_plan[0].is_ended:
             data.route_plan.pop(0)

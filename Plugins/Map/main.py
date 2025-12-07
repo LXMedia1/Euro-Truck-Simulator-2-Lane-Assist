@@ -56,7 +56,7 @@ class Plugin(ETS2LAPlugin):
             "This plugin provides steering and navigation features. It is the most important plugin in ETS2LA."
         ),
         version="2.0.0",
-        modules=["SDKController", "TruckSimAPI", "Steering", "Route"],
+        modules=["SDKController", "TruckSimAPI", "Steering", "Route", "Traffic"],
         tags=["Base", "Steering"],
         listen=["main.py"],
         ui_filename="ui.py",
@@ -318,6 +318,7 @@ class Plugin(ETS2LAPlugin):
                         steering_value = -0.95
 
                     self.tags.steering = steering_value
+                    self.tags.lane_change_speed_factor = data.lane_change_speed_factor
                     steering.run(
                         value=steering_value, sendToGame=data.enabled, drawLine=False
                     )
@@ -391,8 +392,15 @@ class Plugin(ETS2LAPlugin):
                         if "hw" in data.route_plan[0].items[0].item.road_look.name
                         else "normal"
                     )
+                    self.tags.current_prefab_type = None
                 else:
                     self.tags.road_type = "normal"
+                    # Expose current prefab type for ACC speed limiting
+                    current_item = data.route_plan[0].items[0].item
+                    if isinstance(current_item, c.Prefab):
+                        self.tags.current_prefab_type = current_item.prefab_type
+                    else:
+                        self.tags.current_prefab_type = None
 
                 self.tags.route_information = [
                     item.information_json() for item in data.route_plan

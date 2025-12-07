@@ -720,7 +720,7 @@ state_object = None
 def PrintState(start_time: float, message: str):
     global progress, start_ram_usage
     start_ram_usage = psutil.Process(os.getpid()).memory_info().rss
-    print(f" → {message}", end="\r")
+    print(f" -> {message}", end="\r")
     if state_object is not None:
         progress += 1
         state_object.text = f"{round(progress / total_steps * 100)}% - {message}"

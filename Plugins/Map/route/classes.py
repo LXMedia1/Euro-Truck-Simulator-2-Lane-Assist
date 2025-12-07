@@ -7,6 +7,10 @@ import logging
 import math
 import time
 
+# Lane change debug logger
+lane_change_logger = logging.getLogger("LaneChange")
+lane_change_logger.setLevel(logging.DEBUG)
+
 
 class RouteItem:
     item: list[c.Prefab | c.Road]
@@ -144,21 +148,14 @@ class RouteSection:
             return
 
         if self.is_lane_changing:
-            logging.warning(
-                "Something tried to change the lane index while the route section is still lane changing."
+            lane_change_logger.warning(
+                f"BLOCKED: Tried to change lane {self._lane_index} -> {value} while already changing"
             )
             return
 
-        self.last_lane_points = self.lane_points.copy() if self.lane_points else []
-        new_lane_points: list[c.Position] = []
-        for item in self.items:
-            item.lane_index = value
-            new_lane_points += item.lane_points
-
-        new_lane_points = new_lane_points if not self.invert else new_lane_points[::-1]
-
+        # Validate distance BEFORE logging "STARTING" to avoid spam
         if self.lane_points:
-            lanes_to_move_over = abs(value - self.lane_index)
+            lanes_to_move_over = abs(value - self._lane_index)
             lane_change_distance = (
                 self.get_planned_lane_change_distance(lane_count=lanes_to_move_over) * 2
             )  # * 2 for the initial static area
@@ -178,10 +175,22 @@ class RouteSection:
                     self.skip_indicate_state = True
                     lane_change_distance = dist_left
                 else:
-                    logging.warning(
-                        f"Something tried to do a lane change requiring [dim]{lane_change_distance:.0f}m[/dim], but only [dim]{dist_left:.0f}m[/dim] is left."
+                    lane_change_logger.debug(
+                        f"Lane change {self._lane_index} -> {value} rejected: need {lane_change_distance:.0f}m, only {dist_left:.0f}m left"
                     )
                     return
+
+        lane_change_logger.info(f"STARTING lane change: {self._lane_index} -> {value}")
+
+        self.last_lane_points = self.lane_points.copy() if self.lane_points else []
+        new_lane_points: list[c.Position] = []
+        for item in self.items:
+            item.lane_index = value
+            new_lane_points += item.lane_points
+
+        new_lane_points = new_lane_points if not self.invert else new_lane_points[::-1]
+
+        if self.lane_points:
 
             if self._start_at_truck:
                 self.lane_change_start = c.Position(
@@ -209,11 +218,15 @@ class RouteSection:
             if self.lane_change_points:
                 self.is_lane_changing = True
                 self._lane_change_progress = 0.0
+                lane_change_logger.info(f"Lane change ACTIVATED: distance={lane_change_distance:.1f}m, points={len(self.lane_change_points)}")
+            else:
+                lane_change_logger.warning("Lane change NOT activated: no lane_change_points generated")
 
         self.lane_points = new_lane_points
         self._last_lane_index = self._lane_index
         self._lane_index = value
         self.skip_indicate_state = False
+        lane_change_logger.info(f"Lane index set to {value}")
 
     def _calculate_lane_change_points(
         self, start_points: list[c.Position], end_points: list[c.Position]
@@ -312,13 +325,15 @@ class RouteSection:
         if value == []:
             return
 
-        closest = min(value, key=lambda x: abs(x - self.lane_index))
-        if closest == self.lane_index:
+        # Filter out invalid lane indices (e.g., prefab route indices that don't apply to roads)
+        max_lane_index = len(self.items[0].item.lanes) - 1
+        valid_lanes = [lane for lane in value if 0 <= lane <= max_lane_index]
+        if not valid_lanes:
+            # No valid lanes to target - this is expected when crossing from prefab to road
             return
-        if closest > len(self.items[0].item.lanes) - 1 or closest < 0:
-            logging.warning(
-                f"Something tried to set an [red]invalid target lane index of {closest}[/red] when [dim]RouteSection[/dim] only has {len(self.items[0].item.lanes)} lanes."
-            )
+
+        closest = min(valid_lanes, key=lambda x: abs(x - self.lane_index))
+        if closest == self.lane_index:
             return
 
         # Check if the other lane is on the wrong side of the road
@@ -456,6 +471,7 @@ class RouteSection:
                 time.sleep(1 / 20)
 
     def cancel_lane_change(self):
+        lane_change_logger.warning(f"CANCELLED lane change at progress {self._lane_change_progress:.2f}")
         self.is_lane_changing = False
         self._lane_change_progress = 0
         self.lane_points = self.last_lane_points
@@ -464,6 +480,7 @@ class RouteSection:
     def indicate_right(self):
         if data.enabled:
             if data.truck_indicating_left:
+                lane_change_logger.info("indicate_right: truck indicating left, cancelling")
                 self.cancel_lane_change()
                 return
 
@@ -476,6 +493,7 @@ class RouteSection:
     def indicate_left(self):
         if data.enabled:
             if data.truck_indicating_right:
+                lane_change_logger.info("indicate_left: truck indicating right, cancelling")
                 self.cancel_lane_change()
                 return
 
@@ -560,10 +578,12 @@ class RouteSection:
                 self.indicate_left()
 
         if not self.is_lane_changing:  # got cancelled in the indicate functions
+            lane_change_logger.info("get_points: lane change was cancelled by indicator")
             return self.discard_points_behind(self.lane_points)
 
         # Check if lane change is complete
         if self._lane_change_progress > 0.98:
+            lane_change_logger.info(f"COMPLETED lane change (progress: {self._lane_change_progress:.2f})")
             self.is_lane_changing = False
             # Turn off blinkers after lane change
             self.reset_indicators()

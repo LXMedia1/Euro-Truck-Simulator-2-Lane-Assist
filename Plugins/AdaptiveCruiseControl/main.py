@@ -954,6 +954,21 @@ class Plugin(ETS2LAPlugin):
             if target_speed > settings.max_speed / 3.6:
                 target_speed = settings.max_speed / 3.6
 
+        # Apply lane change speed factor from Map plugin (slows down when waiting for safe lane change)
+        lane_change_factor = self.tags.lane_change_speed_factor
+        lane_change_factor = self.tags.merge(lane_change_factor)
+        if lane_change_factor is not None and isinstance(lane_change_factor, (int, float)):
+            if lane_change_factor < 1.0:
+                target_speed = target_speed * lane_change_factor
+
+        # Limit speed in toll stations to 25 km/h
+        current_prefab_type = self.tags.current_prefab_type
+        current_prefab_type = self.tags.merge(current_prefab_type)
+        if current_prefab_type == "toll":
+            toll_speed_limit = 25 / 3.6  # 25 km/h in m/s
+            if target_speed > toll_speed_limit:
+                target_speed = toll_speed_limit
+
         return target_speed
 
     def reset(self) -> None:

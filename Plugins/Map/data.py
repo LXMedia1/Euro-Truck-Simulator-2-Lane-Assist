@@ -146,6 +146,8 @@ right_hand_drive = True if settings.traffic_side == "Right Handed" else False
 """Whether the game is in right-hand drive mode or not. This will change the direction of the steering wheel."""
 takeover_when_unreliable = settings.TakeoverWhenUnreliable
 """Whether the plugin should trigger a takeover if the truck is not following the route correctly."""
+lane_change_speed_factor: float = 1.0
+"""Speed factor for when waiting for a safe lane change opportunity. 1.0 = no reduction."""
 
 # MARK: Return values
 external_data = {}

@@ -1,5 +1,6 @@
 # TODO: Fix this file, it's still using the old steering system!
 import Plugins.Map.utils.math_helpers as math_helpers
+import Plugins.Map.utils.lane_safety as lane_safety
 import Plugins.Map.route.classes as rc
 import Plugins.Map.classes as c
 import Plugins.Map.data as data
@@ -7,9 +8,19 @@ from ETS2LA.Events import Event, events
 import numpy as np
 import logging
 import math
+import time
 
 OFFSET_MULTIPLIER = 1.5
 ANGLE_MULTIPLIER = 1
+
+# Lane change state
+_pending_manual_lane_change = False
+_pending_target_index = None
+_last_lane_change_time = 0  # Cooldown to prevent rapid lane changes
+_lane_change_cooldown = 2.0  # seconds
+
+# Rate limiting for warnings
+_last_far_point_warning = 0
 
 
 def get_closest_route_item(items: list[rc.RouteItem]):
@@ -56,16 +67,47 @@ was_indicating = False
 
 
 def CheckForLaneChange():
-    global was_indicating
+    global was_indicating, _pending_manual_lane_change, _pending_target_index, _last_lane_change_time
+
     if isinstance(data.route_plan[0].items[0].item, c.Prefab):
         was_indicating = False
+        _pending_manual_lane_change = False
+        _pending_target_index = None
+        lane_safety.reset_lane_change_state()
+        data.lane_change_speed_factor = 1.0
         return
 
     current_index = data.route_plan[0].lane_index
-    lanes = data.route_plan[0].items[0].item.lanes
+    road = data.route_plan[0].items[0].item
+    lanes = road.lanes
     side = lanes[current_index].side
     left_lanes = len([lane for lane in lanes if lane.side == "left"])
-    # lanes = left_lanes + right_lanes
+
+    # Check cooldown - prevent rapid lane change attempts
+    current_time = time.perf_counter()
+    if current_time - _last_lane_change_time < _lane_change_cooldown:
+        return
+
+    # Check if we have a pending lane change waiting for safety
+    if _pending_manual_lane_change and _pending_target_index is not None:
+        is_safe, speed_factor = lane_safety.check_lane_safety(
+            _pending_target_index, current_index, road
+        )
+        if is_safe:
+            # Now safe to change lanes
+            target_index = _pending_target_index
+            data.route_plan[0].lane_index = target_index
+            data.route_plan = [data.route_plan[0]]
+            _pending_manual_lane_change = False
+            _pending_target_index = None
+            _last_lane_change_time = current_time  # Start cooldown
+            data.lane_change_speed_factor = 1.0  # Reset speed factor after successful lane change
+            lane_safety.reset_lane_change_state()
+            logging.info(f"Lane change executed: {current_index} -> {target_index}")
+        else:
+            # Still waiting - slow down for safety
+            data.lane_change_speed_factor = speed_factor
+        return
 
     if (
         data.truck_indicating_right or data.truck_indicating_left
@@ -108,11 +150,33 @@ def CheckForLaneChange():
         if target_index >= len(lanes):
             target_index = len(lanes) - 1
 
-        data.route_plan[0].lane_index = target_index
-        data.route_plan = [data.route_plan[0]]
+        # Check if lane change is safe before executing
+        is_safe, speed_factor = lane_safety.check_lane_safety(
+            target_index, current_index, road
+        )
+
+        if is_safe:
+            # Safe to change lanes immediately
+            data.route_plan[0].lane_index = target_index
+            data.route_plan = [data.route_plan[0]]
+            data.lane_change_speed_factor = 1.0
+            _last_lane_change_time = current_time  # Start cooldown
+            logging.info(f"Lane change executed immediately: {current_index} -> {target_index}")
+        else:
+            # Not safe - set pending and slow down
+            _pending_manual_lane_change = True
+            _pending_target_index = target_index
+            data.lane_change_speed_factor = speed_factor
+            logging.info(f"Lane change pending: {current_index} -> {target_index}, waiting for safe gap (speed factor: {speed_factor:.2f})")
 
     elif not data.truck_indicating_left and not data.truck_indicating_right:
         was_indicating = False
+        if _pending_manual_lane_change:
+            # Turn signal turned off while waiting - cancel pending lane change
+            _pending_manual_lane_change = False
+            _pending_target_index = None
+            data.lane_change_speed_factor = 1.0
+            lane_safety.reset_lane_change_state()
 
 
 def GetPointDistance(points_so_far: int, total_points: int = 50) -> float:
@@ -215,9 +279,16 @@ def GetSteering():
         (points[-1].x, points[-1].z), (data.truck_x, data.truck_z)
     )
 
-    if first_distance > 4.5 and last_distance > 4.5:  # 1 lane width
-        logging.warning("First point in route is too far away, ignoring this frame.")
-        if data.enabled and data.takeover_when_unreliable:
+    # Check if closest point is too far - use 10m threshold (allows for sparse points)
+    # Only trigger takeover if genuinely lost (both points > 15m away)
+    min_distance = min(first_distance, last_distance)
+    if min_distance > 10:
+        global _last_far_point_warning
+        current_time = time.perf_counter()
+        if current_time - _last_far_point_warning > 5:  # Only log every 5 seconds
+            logging.warning(f"Route points too far away ({min_distance:.1f}m), ignoring steering.")
+            _last_far_point_warning = current_time
+        if data.enabled and data.takeover_when_unreliable and min_distance > 15:
             events.trigger("takeover", Event())
             data.plugin.notify("Takeover: Steering unreliable")
         data.route_points = points
