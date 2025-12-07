@@ -53,9 +53,13 @@ class _ReceivedEvent:
     event: Event
     args: list
     kwargs: dict
+    created_at: float
+    """Timestamp when this event was created (for TTL cleanup)."""
 
     confirmed: list
     """List of plugin IDs that have confirmed sending this event."""
+
+    EVENT_TTL = 60.0  # Events expire after 60 seconds
 
     def __init__(self, alias: str, event: Event, args: list, kwargs: dict):
         self.confirmed = []
@@ -63,6 +67,11 @@ class _ReceivedEvent:
         self.event = event
         self.args = args
         self.kwargs = kwargs
+        self.created_at = time.time()
+
+    def is_expired(self) -> bool:
+        """Check if this event has exceeded its TTL."""
+        return time.time() - self.created_at > self.EVENT_TTL
 
     def confirm(self, plugin_id: str):
         if plugin_id not in self.confirmed:
@@ -316,6 +325,7 @@ class Plugin:
                 time.sleep(0.25)
 
     def event_handler(self):
+        last_cleanup = time.time()
         while True:
             if self.stop:
                 return
@@ -345,6 +355,15 @@ class Plugin:
                     )
                     self.queue.put(message, block=True)
                     event.confirm(self.description.id)
+
+            # Cleanup expired events every 10 seconds (prevents memory leak if plugin crashes)
+            if time.time() - last_cleanup > 10:
+                last_cleanup = time.time()
+                with _events_lock:
+                    expired_count = len([e for e in self.events if e.is_expired()])
+                    if expired_count > 0:
+                        self.events[:] = [e for e in self.events if not e.is_expired()]
+                        logging.debug(f"Cleaned up {expired_count} expired events")
 
             if self.running:
                 time.sleep(0.01)
