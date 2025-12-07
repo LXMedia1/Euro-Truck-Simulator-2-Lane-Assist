@@ -86,6 +86,10 @@ route_plan: list[RouteSection] = []
 """The current route plan."""
 route_points: list[Position] = []
 """The current route points."""
+route_points_backup: list[Position] = []
+"""Backup of route points used during route recalculation to prevent lane loss."""
+route_recalculating: bool = False
+"""Flag indicating that route is being recalculated, use backup points."""
 navigation_plan: list = []
 """List of RouteNodes that will drive the truck to the destination."""
 last_length: int = 0
@@ -256,12 +260,21 @@ def UpdateData(api_data):
     if dst_city_token != dest_city_token:
         dest_city_token = dst_city_token
         dest_city = map.get_city_by_token(dst_city_token)
+        # Backup route points when destination changes (waypoint added)
+        if len(route_points) > 5:
+            global route_points_backup, route_recalculating
+            route_points_backup = route_points.copy()
+            route_recalculating = True
 
     if dst_company_token != dest_company_token:
         dest_company_token = dst_company_token
         dest_company = map.get_company_item_by_token_and_city(
             dst_company_token, dst_city_token
         )
+        # Backup route points when destination changes (waypoint added)
+        if len(route_points) > 5:
+            route_points_backup = route_points.copy()
+            route_recalculating = True
 
     if not drive_based_on_trailer:
         trailer_attached = False

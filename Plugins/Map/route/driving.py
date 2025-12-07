@@ -282,6 +282,12 @@ def GetSteering():
     global _was_path_lost, _path_reacquire_time, _last_steering_value, _last_far_point_warning
 
     if len(data.route_plan) == 0:
+        # During route recalculation, use backup points instead of triggering takeover
+        if data.route_recalculating and len(data.route_points_backup) > 5:
+            # Keep using backup points - don't clear or trigger takeover
+            data.route_points = data.route_points_backup.copy()
+            return _last_steering_value if _last_steering_value != 0 else 0
+
         if data.enabled and data.takeover_when_unreliable:
             events.trigger("takeover", Event())
             data.plugin.notify("Takeover: Lost route tracking, please drive manually")
@@ -327,6 +333,10 @@ def GetSteering():
                         points.append(point)
 
     if len(points) == 0:
+        # During route recalculation, use backup points instead of returning 0
+        if data.route_recalculating and len(data.route_points_backup) > 5:
+            data.route_points = data.route_points_backup.copy()
+            return _last_steering_value if _last_steering_value != 0 else 0
         data.route_points = []
         return 0
 

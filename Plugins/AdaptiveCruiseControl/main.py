@@ -131,6 +131,17 @@ class Plugin(ETS2LAPlugin):
     emergency_decel = -6.0
     time_gap_seconds = 2.0
 
+    # Coasting parameters (fuel efficiency)
+    base_coast_upper = 0.12      # m/s² - target accel above this -> throttle
+    base_coast_lower = -0.25     # m/s² - target accel below this -> brake
+    base_speed_tolerance = 3.0   # km/h tolerance around target speed
+
+    coast_upper = 0.12
+    coast_lower = -0.25
+    speed_tolerance = 3.0
+    is_coasting = False
+    coast_hysteresis = 0.05      # prevents oscillation between states
+
     # PID gains
     kp_accel = 0.30  # Proportional gain
     ki_accel = 0.08  # Integral gain
@@ -178,8 +189,20 @@ class Plugin(ETS2LAPlugin):
     def calculate_speedlimit_constraint(self):
         self.add_ar_text("Speedlimit Constraint:")
         speed_error = self.speedlimit - self.speed
-        speed_limit_accel = speed_error * 0.5
-        self.add_ar_text(f" - Error: {speed_error * 3.6:.1f} kph")
+        speed_error_kph = speed_error * 3.6
+        self.add_ar_text(f" - Error: {speed_error_kph:.1f} kph")
+
+        # Speed tolerance zone: reduce corrections when near target speed
+        # This enables coasting behavior for fuel efficiency
+        tolerance_ms = self.speed_tolerance / 3.6  # Convert km/h to m/s
+        if abs(speed_error) < tolerance_ms:
+            # Within tolerance - scale down the correction proportionally
+            scale = abs(speed_error) / tolerance_ms
+            speed_limit_accel = speed_error * 0.5 * scale * 0.5
+            self.add_ar_text(f" - In tolerance zone (scale: {scale:.2f})")
+        else:
+            speed_limit_accel = speed_error * 0.5
+
         self.add_ar_text(f" - Raw Accel: {speed_limit_accel:.2f} m/s²")
 
         if speed_error * 3.6 > 10:
@@ -337,14 +360,26 @@ class Plugin(ETS2LAPlugin):
             self.max_accel = self.base_max_accel * 2
             self.comfort_decel = self.base_comfort_decel * 2
             self.time_gap_seconds = self.base_time_gap_seconds * 0.75
+            # Narrow coast zone for responsive driving
+            self.coast_upper = 0.08
+            self.coast_lower = -0.15
+            self.speed_tolerance = 2.0
         elif aggressiveness == "Eco":
             self.max_accel = self.base_max_accel * 0.66
             self.comfort_decel = self.base_comfort_decel * 0.66
             self.time_gap_seconds = self.base_time_gap_seconds * 1.25
+            # Wide coast zone for fuel efficiency
+            self.coast_upper = 0.18
+            self.coast_lower = -0.35
+            self.speed_tolerance = 4.0
         else:
             self.max_accel = self.base_max_accel
             self.comfort_decel = self.base_comfort_decel
             self.time_gap_seconds = self.base_time_gap_seconds
+            # Balanced coast zone
+            self.coast_upper = self.base_coast_upper
+            self.coast_lower = self.base_coast_lower
+            self.speed_tolerance = self.base_speed_tolerance
 
         self.speed_offset_type = speed_offset_type
         if self.speed_offset_type is None:
@@ -1030,7 +1065,29 @@ class Plugin(ETS2LAPlugin):
         elif self.state.text == "Detected reverse gear. Please shift to drive.":
             self.state.text = ""
 
-        if target_accel > 0:
+        # Three-state control: Throttle | Coast | Brake
+        # Apply hysteresis to prevent oscillation between states
+        if self.is_coasting:
+            upper_bound = self.coast_upper + self.coast_hysteresis
+            lower_bound = self.coast_lower - self.coast_hysteresis
+        else:
+            upper_bound = self.coast_upper
+            lower_bound = self.coast_lower
+
+        # Determine if we can coast (only above minimum speed)
+        min_coast_speed = 10 / 3.6  # 10 km/h in m/s
+        can_coast = (self.speed > min_coast_speed and
+                     lower_bound <= target_accel <= upper_bound)
+
+        if can_coast:
+            # COAST: Release both throttle and brake, let the truck roll
+            self.is_coasting = True
+            self.controller.aforward = float(0)
+            self.controller.abackward = float(0)
+            self.set_zero = True
+        elif target_accel > 0:
+            # THROTTLE: Need to accelerate
+            self.is_coasting = False
             if (
                 clutch < 0.1 or speed < 10 / 3.6
             ):  # ignore clutch when low speed (at traffic lights)
@@ -1044,6 +1101,8 @@ class Plugin(ETS2LAPlugin):
             elif not self.set_zero:
                 self.controller.abackward = float(0.0001)
         else:
+            # BRAKE: Need to decelerate more than coasting provides
+            self.is_coasting = False
             self.set_zero = False
             self.controller.abackward = float(-target_accel)
             self.controller.aforward = float(0)
@@ -1068,15 +1127,17 @@ class Plugin(ETS2LAPlugin):
         # Proportional term
         p_term = self.kp_accel * accel_error
 
-        if accel_error * dt > 0:
-            if (
-                self.accel < 0.95
-            ):  # Don't add more integral if already going full throttle
+        # Don't accumulate integral errors while coasting to prevent windup
+        if not self.is_coasting:
+            if accel_error * dt > 0:
+                if (
+                    self.accel < 0.95
+                ):  # Don't add more integral if already going full throttle
+                    self.accel_errors.append(accel_error * dt)
+            else:
+                if len(self.accel_errors) != 0 and self.accel_errors[0] > 0:
+                    self.accel_errors = self.accel_errors[1:]
                 self.accel_errors.append(accel_error * dt)
-        else:
-            if len(self.accel_errors) != 0 and self.accel_errors[0] > 0:
-                self.accel_errors = self.accel_errors[1:]
-            self.accel_errors.append(accel_error * dt)
 
         # Clear the integral term if we're speeding
         # (dynamically adjust the number to keep at the speedlimit)

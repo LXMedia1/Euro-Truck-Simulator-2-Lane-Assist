@@ -198,6 +198,12 @@ class Plugin(ETS2LAPlugin):
 
     @events.on("JobFinished")
     def JobFinished(self, event_object, *args, **kwargs):
+        # Save backup of current route points before clearing
+        # This prevents lane loss during route recalculation
+        if len(data.route_points) > 5:
+            data.route_points_backup = data.route_points.copy()
+            data.route_recalculating = True
+
         data.dest_company = None
         data.route_plan = []
         data.navigation_plan = []
@@ -454,7 +460,15 @@ class Plugin(ETS2LAPlugin):
                 except Exception:
                     pass
 
-        self.tags.steering_points = [point.tuple() for point in data.route_points]
+        # Use backup route points during recalculation to prevent lane loss
+        if data.route_recalculating and len(data.route_points) < 5 and len(data.route_points_backup) > 5:
+            self.tags.steering_points = [point.tuple() for point in data.route_points_backup]
+        else:
+            self.tags.steering_points = [point.tuple() for point in data.route_points]
+            # Clear recalculating flag once we have valid new points
+            if data.route_recalculating and len(data.route_points) >= 5:
+                data.route_recalculating = False
+                data.route_points_backup = []
 
         try:
             if self.last_city_update + 5 < time.time():
