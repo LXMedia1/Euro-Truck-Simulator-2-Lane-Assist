@@ -60,6 +60,29 @@ Connected websockets and their messages.
 condition = threading.Condition()
 """Threading condition to wait for a response"""
 
+# Persistent event loop for sync wrappers (avoids creating/destroying loops)
+_loop: asyncio.AbstractEventLoop | None = None
+_loop_lock = threading.Lock()
+
+def _get_or_create_loop() -> asyncio.AbstractEventLoop:
+    """Get or create a persistent event loop for sync operations."""
+    global _loop
+    with _loop_lock:
+        if _loop is None or _loop.is_closed():
+            _loop = asyncio.new_event_loop()
+            # Start loop in background thread
+            def run_loop():
+                asyncio.set_event_loop(_loop)
+                _loop.run_forever()
+            threading.Thread(target=run_loop, daemon=True).start()
+        return _loop
+
+def _run_async(coro):
+    """Run an async coroutine using the persistent event loop."""
+    loop = _get_or_create_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=30)  # 30 second timeout
+
 
 async def server(websocket, path) -> None:
     """The main websocket server that listens for client's
@@ -115,9 +138,9 @@ async def send_sonner(
     message_dict = {"text": text, "type": type, "promise": sonner_promise}
 
     message = json.dumps(message_dict)
-    tasks = [asyncio.create_task(ws.send(message)) for ws in connected]
+    tasks = [ws.send(message) for ws in connected]
     if tasks:
-        await asyncio.wait(tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def sonner(
@@ -126,18 +149,21 @@ def sonner(
     sonner_promise: str | None = None,
 ) -> None:
     """Blocking non-async function that will send a notification to all connected clients."""
-    asyncio.run(send_sonner(text, type, sonner_promise))
+    try:
+        _run_async(send_sonner(text, type, sonner_promise))
+    except Exception:
+        logging.debug("Failed to send sonner notification")
 
 
-async def send_ask(text: str, options: list[str], description: str) -> dict:
+async def send_ask(text: str, options: list[str], description: str) -> dict | None:
     """Will send a dialog with a question with the given options.
-    This function is blocking until a response is received.
+    This function is blocking until a response is received (with timeout).
 
     :param str text: The text of the question
     :param list[str] options: The options to choose from
     :param str description: The description of the question
 
-    :return str: The response from the client
+    :return dict | None: The response from the client, or None on timeout
     """
     global connected
     message_dict = {
@@ -146,30 +172,42 @@ async def send_ask(text: str, options: list[str], description: str) -> dict:
 
     message = json.dumps(message_dict)
 
-    tasks = [asyncio.create_task(ws.send(message)) for ws in connected]
+    tasks = [ws.send(message) for ws in connected]
     if tasks:
-        await asyncio.wait(tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Wait for a response from all connected clients
-    # TODO: This might deadlock?
+    # Wait for a response with timeout to prevent deadlock
     response = None
+    timeout_seconds = 60  # 60 second timeout for user response
+    start_time = asyncio.get_event_loop().time()
+
     while response is None:
         with condition:
-            condition.wait()
+            # Wait with 1 second timeout to allow checking total elapsed time
+            condition.wait(timeout=1.0)
             for ws in connected:
                 response = connected[ws]
                 if response is not None:
                     connected[ws] = None
                     break
 
+        # Check if we've exceeded the total timeout
+        if asyncio.get_event_loop().time() - start_time > timeout_seconds:
+            logging.warning("Timed out waiting for user response")
+            return None
+
     return response
 
 
-def ask(text: str, options: list, description: str = "") -> dict:
+def ask(text: str, options: list, description: str = "") -> dict | None:
     """Non-async function that will send a dialog with a question with the given options."""
     sounds.Play("prompt")
-    response = asyncio.run(send_ask(text, options, description))
-    return response
+    try:
+        response = _run_async(send_ask(text, options, description))
+        return response
+    except Exception:
+        logging.warning("Failed to get user response")
+        return None
 
 
 async def send_navigate(url: str, sender: str, reason: str = "") -> None:
@@ -181,9 +219,9 @@ async def send_navigate(url: str, sender: str, reason: str = "") -> None:
     message_dict = {"navigate": {"url": url, "reason": reason, "sender": sender}}
 
     message = json.dumps(message_dict)
-    tasks = [asyncio.create_task(ws.send(message)) for ws in connected]
+    tasks = [ws.send(message) for ws in connected]
     if tasks:
-        await asyncio.wait(tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def navigate(url: str, sender: str, reason: str = "") -> None:
@@ -191,37 +229,49 @@ def navigate(url: str, sender: str, reason: str = "") -> None:
     if url == "":
         logging.error(_("Tried to send an empty page."))
         return
-    asyncio.run(send_navigate(url, sender, reason))
+    try:
+        _run_async(send_navigate(url, sender, reason))
+    except Exception:
+        logging.debug("Failed to send navigation command")
 
 
 async def send_dialog(json_data: dict, no_response: bool = False) -> dict | None:
     """Send a dialog with the given json data to all connected clients.
-    Will wait for a response if no_response is False.
+    Will wait for a response if no_response is False (with timeout).
 
     :param dict json_data: The JSON data to send to the dialog
     :param bool no_response: If True, this function will not wait for a response.
 
-    :return dict: The response from the client
+    :return dict | None: The response from the client, or None on timeout
     """
     global connected
     message_dict = {"dialog": {"json": json_data}}
 
     message = json.dumps(message_dict)
-    tasks = [asyncio.create_task(ws.send(message)) for ws in connected]
+    tasks = [ws.send(message) for ws in connected]
     if tasks:
-        await asyncio.wait(tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Wait for a response from all connected clients
+    # Wait for a response from all connected clients with timeout
     response = None
     if not no_response:
+        timeout_seconds = 60  # 60 second timeout for user response
+        start_time = asyncio.get_event_loop().time()
+
         while response is None:
             with condition:
-                condition.wait()
+                # Wait with 1 second timeout to allow checking total elapsed time
+                condition.wait(timeout=1.0)
                 for ws in connected:
                     response = connected[ws]
                     if response is not None:
                         connected[ws] = None
                         break
+
+            # Check if we've exceeded the total timeout
+            if asyncio.get_event_loop().time() - start_time > timeout_seconds:
+                logging.warning("Timed out waiting for dialog response")
+                return None
 
     return response
 
@@ -235,8 +285,12 @@ def dialog(ui: dict, no_response: bool = False) -> dict | None:
     :return dict | None: The response from the client
     """
     sounds.Play("prompt")
-    response = asyncio.run(send_dialog(ui, no_response))
-    return response
+    try:
+        response = _run_async(send_dialog(ui, no_response))
+        return response
+    except Exception:
+        logging.warning("Failed to get dialog response")
+        return None
 
 
 async def start() -> None:

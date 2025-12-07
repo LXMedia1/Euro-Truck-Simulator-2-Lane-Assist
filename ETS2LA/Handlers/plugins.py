@@ -533,7 +533,7 @@ class Plugin:
             self.process = None
         except Exception:
             pass
-        quit(1)
+        logging.info(f"Plugin {self.description.name} removed successfully")
         return
 
     def was_edited(self) -> bool:
