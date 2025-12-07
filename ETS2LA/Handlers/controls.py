@@ -31,16 +31,22 @@ settings_file = "ETS2LA/controls.json"
 The settings file to use when saving and editing the controls.
 """
 
+# Thread-safe locks for shared state
+_joysticks_lock = threading.Lock()
+_event_info_lock = threading.Lock()
+_pressed_keys_lock = threading.Lock()
+_pause_event = threading.Event()  # Replaces pause_queue_listener boolean
+
 joysticks = {}
 """
 This variable will be update with the state of the joysticks
-every 50ms.
+every 50ms. Protected by _joysticks_lock.
 """
 
 event_information = {}
 """
 This variable will store information for all events.
-It will be updated as any information changes.
+It will be updated as any information changes. Protected by _event_info_lock.
 """
 
 queue = multiprocessing.Queue()
@@ -49,24 +55,20 @@ The multiprocessing queue that the joystick update process
 will use to output the current values from joysticks.
 """
 
-pause_queue_listener = False
-"""
-Whether to pause the queue listener to hijack the queue
-output with another process.
-"""
-
-
 pressed_keys = set()
+"""Protected by _pressed_keys_lock."""
 
 
 def on_press(key):
     key_str = key_to_str(key)
-    pressed_keys.add(key_str)
+    with _pressed_keys_lock:
+        pressed_keys.add(key_str)
 
 
 def on_release(key):
     key_str = key_to_str(key)
-    pressed_keys.discard(key_str)
+    with _pressed_keys_lock:
+        pressed_keys.discard(key_str)
 
 
 listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
@@ -168,11 +170,11 @@ def queue_listener_thread(joystick_queue: multiprocessing.Queue) -> None:
     :param multiprocessing.Queue joystick_queue: The queue to listen to.
     """
     global joysticks
-    global pause_queue_listener
 
     while True:
-        while pause_queue_listener:
-            time.sleep(0.5)
+        # Wait if paused (uses Event for proper thread signaling)
+        while _pause_event.is_set():
+            time.sleep(0.1)
 
         try:
             state = joystick_queue.get(block=False)
@@ -180,7 +182,8 @@ def queue_listener_thread(joystick_queue: multiprocessing.Queue) -> None:
             time.sleep(0.025)  # 40 fps
             continue
 
-        joysticks = state
+        with _joysticks_lock:
+            joysticks = state
 
 
 def event_information_update(once: bool = False) -> None:
@@ -199,7 +202,9 @@ def event_information_update(once: bool = False) -> None:
 
     while True:
         if os.path.getmtime(settings_file) != last_modify_time:
-            event_information = settings.GetJSON(settings_file)
+            new_info = settings.GetJSON(settings_file)
+            with _event_info_lock:
+                event_information = new_info
             last_modify_time = os.path.getmtime(settings_file)
 
         if once:
@@ -335,35 +340,42 @@ def get_states(events: list[ControlEvent]) -> dict:
     :return dict: The return dictionary.
     """
     states = {}
+
+    # Take snapshots under locks for thread safety
+    with _pressed_keys_lock:
+        keys_snapshot = pressed_keys.copy()
+    with _joysticks_lock:
+        joysticks_snapshot = joysticks.copy()
+
     for event in events:
         info = get_event_information(event)
         if info["guid"] == "keyboard":
             key = info["key"]
-            states[event.alias] = key in pressed_keys
+            states[event.alias] = key in keys_snapshot
             continue
 
         if info["guid"] == "keyboard":
             key = info["key"]
             if len(key) == 1:
-                states[event.alias] = key in pressed_keys
+                states[event.alias] = key in keys_snapshot
             else:
                 states[event.alias] = (
-                    getattr(pynput_keyboard.Key, key, None) in pressed_keys
+                    getattr(pynput_keyboard.Key, key, None) in keys_snapshot
                 )
             continue
 
         if event.type == "button":
-            if info["guid"] not in joysticks:
+            if info["guid"] not in joysticks_snapshot:
                 states[event.alias] = False
                 continue
-            states[event.alias] = joysticks[info["guid"]][f"{info['key']}"]
+            states[event.alias] = joysticks_snapshot[info["guid"]][f"{info['key']}"]
 
         elif event.type == "axis":
-            if info["guid"] not in joysticks:
+            if info["guid"] not in joysticks_snapshot:
                 states[event.alias] = 0
                 continue
 
-            states[event.alias] = joysticks[info["guid"]][f"{info['key']}"]
+            states[event.alias] = joysticks_snapshot[info["guid"]][f"{info['key']}"]
 
     return states
 
@@ -374,23 +386,24 @@ def edit_event(event: ControlEvent | str) -> None:
 
     :param ControlEvent | str event: The event to edit.
     """
-    global pause_queue_listener
-    pause_queue_listener = True
+    _pause_event.set()  # Signal queue listener to pause
 
     if isinstance(event, str):
         try:
             event = load_event_from_alias(event)
         except ValueError:
             logging.error(_("Event with alias '{0}' not found.").format(event))
+            _pause_event.clear()
             return
 
     try:
         new_guid, new_key = control_picker(event, queue)
-        device_name = (
-            joysticks[new_guid]["name"]
-            if new_guid != "" and new_guid != "keyboard"
-            else "Keyboard"
-        )
+        with _joysticks_lock:
+            device_name = (
+                joysticks[new_guid]["name"]
+                if new_guid != "" and new_guid != "keyboard" and new_guid in joysticks
+                else "Keyboard"
+            )
         if new_guid == "":
             save_event_information(
                 event.alias,
@@ -415,8 +428,8 @@ def edit_event(event: ControlEvent | str) -> None:
             )
     except Exception:
         logging.exception(_("Exception occurred while trying to edit the event."))
-
-    pause_queue_listener = False
+    finally:
+        _pause_event.clear()  # Always clear the pause event
 
 
 def unbind_event(event: ControlEvent | str) -> None:

@@ -28,6 +28,12 @@ search_folders: list[str] = ["Plugins", "CataloguePlugins"]
 loading: bool = False
 """Indicator for other files that the plugin handler is still loading plugins."""
 
+# Thread-safe locks for shared state
+_plugins_lock = threading.RLock()  # RLock allows re-entrant locking
+_tags_lock = threading.RLock()
+_pages_lock = threading.RLock()
+_events_lock = threading.RLock()
+
 # Discover all plugins in the search folders.
 plugin_folders: list[str] = []
 
@@ -62,12 +68,18 @@ class _ReceivedEvent:
         if plugin_id not in self.confirmed:
             self.confirmed.append(plugin_id)
 
-        if len(self.confirmed) >= len(plugins):
-            try:
-                plugins[0].events.remove(self)
-            except Exception as e:
-                logging.error(f"Error removing event {self.alias}: {e}")
-                pass
+        with _plugins_lock:
+            plugins_count = len(plugins)
+        if len(self.confirmed) >= plugins_count:
+            with _events_lock:
+                try:
+                    # Access first plugin's events safely
+                    with _plugins_lock:
+                        if plugins:
+                            plugins[0].events.remove(self)
+                except Exception as e:
+                    logging.error(f"Error removing event {self.alias}: {e}")
+                    pass
 
 
 # MARK: Class

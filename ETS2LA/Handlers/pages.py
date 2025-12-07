@@ -2,6 +2,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from ETS2LA.Networking.cloud import SendCrashReport
 import ETS2LA.variables as variables
 import importlib
+import threading
 import logging
 import time
 import sys
@@ -11,6 +12,9 @@ PAGES_PATH = "Pages"
 page_objects = {}
 last_modified_times = {}
 last_update_times = {}
+
+# Proper thread-safe lock for UI updates (replaces broken IS_UI_UPDATING pattern)
+_ui_lock = threading.Lock()
 
 
 class PageManager:
@@ -52,15 +56,18 @@ class PageManager:
 
     @staticmethod
     def acquire_ui_lock():
-        """Wait until UI is not updating and acquire the lock."""
-        while variables.IS_UI_UPDATING:
-            time.sleep(0.01)
-        variables.IS_UI_UPDATING = True
+        """Acquire the UI update lock (thread-safe)."""
+        _ui_lock.acquire()
+        variables.IS_UI_UPDATING = True  # Keep for backwards compatibility
 
     @staticmethod
     def release_ui_lock():
-        """Release UI update lock."""
-        variables.IS_UI_UPDATING = False
+        """Release UI update lock (thread-safe)."""
+        variables.IS_UI_UPDATING = False  # Keep for backwards compatibility
+        try:
+            _ui_lock.release()
+        except RuntimeError:
+            pass  # Lock not held
 
     files = []
 
