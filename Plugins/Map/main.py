@@ -31,11 +31,17 @@ planning = importlib.import_module("Plugins.Map.route.planning")
 driving = importlib.import_module("Plugins.Map.route.driving")
 im = importlib.import_module("Plugins.Map.utils.internal_map")
 oh = importlib.import_module("Plugins.Map.utils.offset_handler")
-last_plan_hash = hash(open(planning.__file__, encoding="utf-8").read())
-last_drive_hash = hash(open(driving.__file__).read())
-last_nav_hash = hash(open(navigation.__file__, encoding="utf-8").read())
-last_im_hash = hash(open(im.__file__).read())
-last_oh_hash = hash(open(oh.__file__, encoding="utf-8").read())
+
+# Fixed: Use context managers to properly close file handles
+def _read_file_hash(filepath, encoding="utf-8"):
+    with open(filepath, "r", encoding=encoding) as f:
+        return hash(f.read())
+
+last_plan_hash = _read_file_hash(planning.__file__)
+last_drive_hash = _read_file_hash(driving.__file__)
+last_nav_hash = _read_file_hash(navigation.__file__)
+last_im_hash = _read_file_hash(im.__file__)
+last_oh_hash = _read_file_hash(oh.__file__)
 
 UPDATING_OFFSET_CONFIG = False
 DEVELOPER_PRINTING = True

@@ -16,6 +16,7 @@ from ETS2LA.Plugin import (
 )
 
 from memory import SharedMemorySender, SharedMemoryReceiver
+from collections import deque
 import threading
 import importlib
 import logging
@@ -65,9 +66,9 @@ class PluginProcess:
     The current stack of messages to process.
     """
 
-    main_thread_stack: list[PluginMessage] = []
+    main_thread_stack: deque[PluginMessage] = deque()
     """
-    The main thread stack of messages to process.
+    The main thread stack of messages to process (deque for O(1) popleft).
     This is used for operations that should be completed on the main thread,
     such as starting or stopping the plugin.
     """
@@ -366,7 +367,7 @@ class PluginProcess:
         while True:
             # Execute all main thread messages
             if self.main_thread_stack:
-                message = self.main_thread_stack.pop(0)
+                message = self.main_thread_stack.popleft()  # O(1) instead of O(n)
                 match message.channel:
                     case (
                         Channel.ENABLE_PLUGIN
