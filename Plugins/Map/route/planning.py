@@ -8,8 +8,45 @@ import Plugins.Map.classes as c
 import importlib
 import logging
 import math
+import time
 
 importlib.reload(rc)
+
+# Prefab route cache to avoid expensive recalculations
+# Key: (prefab_uid, end_point_hash) -> Value: (lane_ids, timestamp)
+_prefab_lane_cache: dict[tuple, tuple[list[int], float]] = {}
+_prefab_cache_ttl = 30.0  # Cache entries expire after 30 seconds
+
+
+def _get_point_hash(point: c.Position) -> tuple:
+    """Create a hashable key from a position (rounded to reduce cache misses)."""
+    return (round(point.x, 1), round(point.y, 1), round(point.z, 1))
+
+
+def _get_cached_lanes(prefab_uid: int, end_point: c.Position) -> list[int] | None:
+    """Get cached lane calculation if available and not expired."""
+    key = (prefab_uid, _get_point_hash(end_point))
+    if key in _prefab_lane_cache:
+        lanes, timestamp = _prefab_lane_cache[key]
+        if time.perf_counter() - timestamp < _prefab_cache_ttl:
+            return lanes
+        else:
+            del _prefab_lane_cache[key]
+    return None
+
+
+def _cache_lanes(prefab_uid: int, end_point: c.Position, lanes: list[int]) -> None:
+    """Cache lane calculation result."""
+    key = (prefab_uid, _get_point_hash(end_point))
+    _prefab_lane_cache[key] = (lanes, time.perf_counter())
+
+    # Clean old cache entries periodically (keep cache size bounded)
+    if len(_prefab_lane_cache) > 100:
+        current_time = time.perf_counter()
+        expired_keys = [k for k, (_, ts) in _prefab_lane_cache.items()
+                       if current_time - ts > _prefab_cache_ttl]
+        for k in expired_keys:
+            del _prefab_lane_cache[k]
 
 
 def GetRoadsBehindRoad(road: c.Road, include_self: bool = True) -> list[c.Road]:
@@ -128,9 +165,23 @@ def GetClosestRouteSection() -> rc.RouteSection:
 
 
 def GetClosestLanesForPrefab(next_item: c.Prefab, end_point: c.Position) -> list[int]:
+    # Check cache first
+    cached = _get_cached_lanes(next_item.uid, end_point)
+    if cached is not None:
+        return cached
+
+    # Validate nav_routes exist
+    if not next_item.nav_routes:
+        return []
+
+    max_lane_index = len(next_item.nav_routes) - 1
+
     closest_lane_ids = []
     closest_point_distance = math.inf
     for lane_id, lane in enumerate(next_item.nav_routes):
+        # Bounds check
+        if lane_id > max_lane_index:
+            continue
         for point in lane.points:
             distance = math_helpers.DistanceBetweenPoints(
                 (end_point.x, end_point.y, end_point.z), point.tuple()
@@ -143,12 +194,20 @@ def GetClosestLanesForPrefab(next_item: c.Prefab, end_point: c.Position) -> list
 
     accepted_lane_ids = []
     for closest_lane_id in closest_lane_ids:
+        # Bounds check before accessing
+        if closest_lane_id > max_lane_index:
+            continue
         points = next_item.nav_routes[closest_lane_id].points
+        if not points:
+            continue
+
         start_node = None
         start_node_distance = math.inf
         for node in [
             data.map.get_node_by_uid(node_uid) for node_uid in next_item.node_uids
         ]:
+            if node is None:
+                continue
             distance = math_helpers.DistanceBetweenPoints(
                 (points[0].x, points[0].z), (node.x, node.y)
             )
@@ -160,6 +219,8 @@ def GetClosestLanesForPrefab(next_item: c.Prefab, end_point: c.Position) -> list
         for node in [
             data.map.get_node_by_uid(node_uid) for node_uid in next_item.node_uids
         ]:
+            if node is None:
+                continue
             distance = math_helpers.DistanceBetweenPoints(
                 (points[-1].x, points[-1].z), (node.x, node.y)
             )
@@ -171,6 +232,10 @@ def GetClosestLanesForPrefab(next_item: c.Prefab, end_point: c.Position) -> list
             accepted_lane_ids.append(closest_lane_id)
 
     closest_lane_ids = accepted_lane_ids
+
+    # Cache the result
+    _cache_lanes(next_item.uid, end_point, closest_lane_ids)
+
     return closest_lane_ids
 
 

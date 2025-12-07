@@ -25,15 +25,23 @@ class RouteItem:
     def lane_index(self, value: int):
         try:
             if isinstance(self.item, c.Road):
+                # Bounds check for road lanes
+                max_idx = len(self.item.lanes) - 1
+                if value < 0 or value > max_idx:
+                    value = max(0, min(value, max_idx))
                 self.lane_points = self.item.lanes[value].points
             elif isinstance(self.item, c.Prefab):
+                # Bounds check for prefab nav_routes
+                max_idx = len(self.item.nav_routes) - 1
+                if value < 0 or value > max_idx:
+                    value = max(0, min(value, max_idx))
                 self.lane_points = self.item.nav_routes[value].points
             else:
-                print("Invalid item type")
-                print(type(self.item))
+                logging.warning(f"Invalid item type: {type(self.item)}")
+                return
             self._lane_index = value
         except Exception:
-            # logging.exception(f"Something tried to set an [red]invalid lane index of {value}[/red] when [dim]RouteItem[/dim] only has {len(self.item.lanes)} lanes.")
+            logging.debug(f"Failed to set lane index {value}")
             pass
 
 
@@ -74,10 +82,14 @@ class RouteSection:
         if self._start_node is not None:
             return self._start_node
         if isinstance(self.items[0].item, c.Prefab):
+            # Bounds check for lane_index
+            prefab = self.items[0].item
+            if not prefab.prefab_description.nav_routes:
+                return None
+            lane_idx = min(self.lane_index, len(prefab.prefab_description.nav_routes) - 1)
+            lane_idx = max(0, lane_idx)
             # Find the index of the node that matches the first curve
-            nav_route = self.items[0].item.prefab_description.nav_routes[
-                self.lane_index
-            ]
+            nav_route = prefab.prefab_description.nav_routes[lane_idx]
             first_curve = nav_route.curves[0]
             index = self.items[0].item.prefab_description.nav_curves.index(first_curve)
             node_index = 0
@@ -99,10 +111,14 @@ class RouteSection:
         if self._end_node is not None:
             return self._end_node
         if isinstance(self.items[0].item, c.Prefab):
+            # Bounds check for lane_index
+            prefab = self.items[0].item
+            if not prefab.prefab_description.nav_routes:
+                return None
+            lane_idx = min(self.lane_index, len(prefab.prefab_description.nav_routes) - 1)
+            lane_idx = max(0, lane_idx)
             # Find the index of the node that matches the last curve
-            nav_route = self.items[0].item.prefab_description.nav_routes[
-                self.lane_index
-            ]
+            nav_route = prefab.prefab_description.nav_routes[lane_idx]
             last_curve = nav_route.curves[-1]
             index = self.items[0].item.prefab_description.nav_curves.index(last_curve)
             node_index = len(self.items[0].item.prefab_description.nodes) - 1
@@ -131,6 +147,14 @@ class RouteSection:
             self._first_set_done = True
 
         if isinstance(self.items[0].item, c.Prefab):
+            # Validate lane index bounds for prefab
+            max_lane_index = len(self.items[0].item.nav_routes) - 1
+            if value < 0 or value > max_lane_index:
+                logging.warning(
+                    f"Invalid prefab lane index {value}, max is {max_lane_index}. Clamping."
+                )
+                value = max(0, min(value, max_lane_index))
+
             self._last_lane_index = self._lane_index
             self._lane_index = value
             self.lane_points = self.items[0].item.nav_routes[self.lane_index].points
