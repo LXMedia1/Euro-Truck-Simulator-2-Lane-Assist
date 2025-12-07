@@ -20,7 +20,7 @@ class Plugin(ETS2LAPlugin):
         modules=["Traffic", "TruckSimAPI"],
         tags=["Base", "Speed Control"],
         listen=["*.py"],
-        fps_cap=2,
+        fps_cap=10,  # Increased from 2 to 10 for better detection (matches ACC timing)
     )
 
     author = Author(
@@ -72,7 +72,7 @@ class Plugin(ETS2LAPlugin):
 
             path = path[::2]  # 1/2 density for performance
             closest_distance = 999
-            closest_index = -1
+            closest_index = 1  # Fixed: was -1 which caused sensitivity * -1 = negative threshold
             for point in path:
                 point = point.tuple()
                 closest_this_point = 999

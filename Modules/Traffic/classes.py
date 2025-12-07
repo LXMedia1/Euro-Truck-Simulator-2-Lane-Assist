@@ -235,9 +235,13 @@ class Vehicle:
         last_yaw = vehicle.last_rotation.euler()[1]
         current_yaw = self.rotation.euler()[1]
         yaw_diff = current_yaw - last_yaw
-        self.angular_velocity = yaw_diff / time_diff / 2
-        # divide by 2 seems to give more accurate results
-        # TODO: Figure out why
+        # Normalize angle difference to [-180, 180] to handle 360° wraparound
+        while yaw_diff > 180:
+            yaw_diff -= 360
+        while yaw_diff < -180:
+            yaw_diff += 360
+        self.angular_velocity = yaw_diff / time_diff
+        # Note: Removed /2 - was compensating for angle wrapping issues
 
         if abs(self.angular_velocity) > 90:
             self.angular_velocity = 0
