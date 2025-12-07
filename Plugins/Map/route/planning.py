@@ -49,6 +49,121 @@ def _cache_lanes(prefab_uid: int, end_point: c.Position, lanes: list[int]) -> No
             del _prefab_lane_cache[k]
 
 
+def GetAllValidPrefabLanes(prefab: c.Prefab, entry_node_uid: int = None) -> list[int]:
+    """Get all valid through-lanes for a prefab (lanes that go from entry to exit).
+
+    For toll stations, this returns all lanes that can be driven through,
+    not just those closest to the current position.
+    """
+    if not prefab.nav_routes:
+        return []
+
+    valid_lanes = []
+    for lane_id, nav_route in enumerate(prefab.nav_routes):
+        if not nav_route.points or len(nav_route.points) < 2:
+            continue
+
+        # Check if this lane goes through (different start and end nodes)
+        start_point = nav_route.points[0]
+        end_point = nav_route.points[-1]
+
+        start_node = None
+        end_node = None
+        start_dist = math.inf
+        end_dist = math.inf
+
+        for node_uid in prefab.node_uids:
+            node = data.map.get_node_by_uid(node_uid)
+            if node is None:
+                continue
+
+            s_dist = math_helpers.DistanceBetweenPoints(
+                (start_point.x, start_point.z), (node.x, node.y)
+            )
+            e_dist = math_helpers.DistanceBetweenPoints(
+                (end_point.x, end_point.z), (node.x, node.y)
+            )
+
+            if s_dist < start_dist:
+                start_dist = s_dist
+                start_node = node
+            if e_dist < end_dist:
+                end_dist = e_dist
+                end_node = node
+
+        # Lane must go through (different entry/exit nodes)
+        if start_node is not None and end_node is not None and start_node != end_node:
+            # If entry_node specified, only include lanes starting from that node
+            if entry_node_uid is None or (start_node and start_node.uid == entry_node_uid):
+                valid_lanes.append(lane_id)
+
+    return valid_lanes
+
+
+def PrepareEarlyLaneChangeForPrefab() -> None:
+    """Check if the next route section is a prefab and prepare early lane change.
+
+    This function sets target_lanes on the current road section to guide the truck
+    to the correct lane BEFORE entering a prefab (especially toll booths).
+    """
+    if len(data.route_plan) < 2:
+        return
+
+    current_section = data.route_plan[0]
+    next_section = data.route_plan[1]
+
+    # Only apply to road -> prefab transitions
+    if not isinstance(current_section.items[0].item, c.Road):
+        return
+    if not isinstance(next_section.items[0].item, c.Prefab):
+        return
+
+    # Skip if already lane changing
+    if current_section.is_lane_changing:
+        return
+
+    prefab = next_section.items[0].item
+    road = current_section.items[0].item
+
+    # Get the prefab's entry point (first point of its nav_route)
+    prefab_lane_index = next_section.lane_index
+    if prefab_lane_index >= len(prefab.nav_routes):
+        return
+
+    prefab_points = prefab.nav_routes[prefab_lane_index].points
+    if not prefab_points:
+        return
+
+    prefab_entry = prefab_points[0]
+
+    # Find which road lane is closest to the prefab entry point
+    best_road_lane = current_section.lane_index
+    best_distance = math.inf
+
+    for lane_idx, lane in enumerate(road.lanes):
+        if not lane.points:
+            continue
+        # Check the end of the road lane (where it connects to prefab)
+        lane_end = lane.points[-1] if not current_section.invert else lane.points[0]
+        distance = math_helpers.DistanceBetweenPoints(
+            (lane_end.x, lane_end.z), (prefab_entry.x, prefab_entry.z)
+        )
+        if distance < best_distance:
+            best_distance = distance
+            best_road_lane = lane_idx
+
+    # If we need to change lanes, set target_lanes
+    if best_road_lane != current_section.lane_index:
+        # Only change if we have enough distance (at least 50m)
+        dist_left = current_section.distance_left()
+        if dist_left > 50:
+            logging.debug(
+                f"Preparing early lane change for prefab: lane {current_section.lane_index} -> {best_road_lane} "
+                f"(prefab={'toll' if prefab.is_toll else prefab.prefab_type}, distance={dist_left:.0f}m)"
+            )
+            current_section.target_lanes = [best_road_lane]
+
+
 def GetRoadsBehindRoad(road: c.Road, include_self: bool = True) -> list[c.Road]:
     if include_self:
         roads = [road]
@@ -294,7 +409,29 @@ def GetNextRouteSection(route: list[rc.RouteSection] = None) -> rc.RouteSection:
             if len(points) == 0:
                 return None
 
-            closest_lane_ids = GetClosestLanesForPrefab(next_item, points[-1])
+            # For toll stations, get ALL valid through-lanes so we can pick the rightmost
+            # For other prefabs, use closest lanes based on current position
+            if next_item.is_toll:
+                # Get the entry node (the node closest to our current road end)
+                entry_node_uid = None
+                entry_dist = math.inf
+                road_end = points[-1]
+                for node_uid in next_item.node_uids:
+                    node = data.map.get_node_by_uid(node_uid)
+                    if node:
+                        dist = math_helpers.DistanceBetweenPoints(
+                            (road_end.x, road_end.z), (node.x, node.y)
+                        )
+                        if dist < entry_dist:
+                            entry_dist = dist
+                            entry_node_uid = node_uid
+
+                closest_lane_ids = GetAllValidPrefabLanes(next_item, entry_node_uid)
+                if not closest_lane_ids:
+                    # Fallback to standard method
+                    closest_lane_ids = GetClosestLanesForPrefab(next_item, points[-1])
+            else:
+                closest_lane_ids = GetClosestLanesForPrefab(next_item, points[-1])
 
             if len(closest_lane_ids) == 0:
                 return None
@@ -332,23 +469,66 @@ def GetNextRouteSection(route: list[rc.RouteSection] = None) -> rc.RouteSection:
 
             closest_lane_ids = verified_lane_ids
 
-            # Get the lane that is most in the direction of the truck
+            # For toll stations, use ENTRY positions (booth locations) to pick rightmost
+            # For other prefabs, use exit positions
+            if next_item.is_toll:
+                # Use entry points to determine rightmost toll booth
+                entry_positions = [
+                    next_item.nav_routes[lane_id].points[0]
+                    for lane_id in closest_lane_ids
+                ]
+
+                # Calculate road forward direction
+                road_end = points[-1]
+                road_prev = points[-2] if len(points) > 1 else points[-1]
+                forward_x = road_end.x - road_prev.x
+                forward_z = road_end.z - road_prev.z
+
+                # Normalize forward vector
+                forward_len = math.sqrt(forward_x**2 + forward_z**2)
+                if forward_len > 0.001:
+                    forward_x /= forward_len
+                    forward_z /= forward_len
+
+                # Calculate perpendicular RIGHT vector (90 degrees clockwise)
+                # In ETS2 coordinate system: right = (forward_z, -forward_x)
+                right_x = forward_z
+                right_z = -forward_x
+
+                # Find the entry point with maximum projection onto right vector
+                # (furthest to the right relative to road direction)
+                best_lane_idx = 0
+                best_right_proj = -math.inf
+
+                for i, entry in enumerate(entry_positions):
+                    # Vector from road end to entry point
+                    to_entry_x = entry.x - road_end.x
+                    to_entry_z = entry.z - road_end.z
+
+                    # Dot product with right vector = how far right this entry is
+                    right_proj = to_entry_x * right_x + to_entry_z * right_z
+
+                    if right_proj > best_right_proj:
+                        best_right_proj = right_proj
+                        best_lane_idx = i
+
+                best_lane = closest_lane_ids[best_lane_idx]
+                logging.debug(f"Toll station: selected lane {best_lane} (rightmost of {closest_lane_ids}, proj={best_right_proj:.1f})")
+                return PrefabToRouteSection(next_item, best_lane)
+
+            # For non-toll prefabs, use end positions and truck rotation
             end_positions = [
                 next_item.nav_routes[lane_id].points[-1].tuple()
                 for lane_id in closest_lane_ids
             ]
 
-            # For toll stations, prefer the rightmost lane
-            if next_item.is_toll:
-                direction = "right"
-            else:
-                direction = (
-                    "left"
-                    if data.truck_indicating_left
-                    else "right"
-                    if data.truck_indicating_right
-                    else "straight"
-                )
+            direction = (
+                "left"
+                if data.truck_indicating_left
+                else "right"
+                if data.truck_indicating_right
+                else "straight"
+            )
             best_lane = math_helpers.GetMostInDirection(
                 end_positions,
                 data.truck_rotation,
@@ -906,6 +1086,8 @@ def CheckForLaneChange():
         return
 
     ResetState()
+    # Check for early lane change needed for upcoming prefab (toll stations, etc.)
+    PrepareEarlyLaneChangeForPrefab()
     CheckForLaneChangeManual()
 
 
@@ -960,6 +1142,11 @@ def UpdateRoutePlan():
                 next_route_section = None
             if next_route_section is not None:
                 data.route_plan.append(next_route_section)
+                # Check if we need early lane change for upcoming prefab
+                try:
+                    PrepareEarlyLaneChangeForPrefab()
+                except Exception:
+                    pass
 
         if (
             data.truck_indicating_left or data.truck_indicating_right
@@ -1025,6 +1212,11 @@ def UpdateRoutePlan():
                     last_end = data.route_plan[-1].end_node.uid
                     if start != last_start or end != last_end:
                         data.route_plan.append(item)
+                        # Check if we need early lane change for upcoming prefab
+                        try:
+                            PrepareEarlyLaneChangeForPrefab()
+                        except Exception:
+                            pass
             except Exception:
                 pass
         try:
