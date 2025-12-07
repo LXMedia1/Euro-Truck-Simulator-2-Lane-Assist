@@ -252,6 +252,14 @@ class Plugin(ETS2LAPlugin):
     prox_beep = False
     beeper = ProximityBeep()
 
+    # Settings cache to avoid reloading unchanged settings every frame
+    _cached_provider: str = ""
+    _cached_voice: str = ""
+    _cached_volume: float = 0.0
+    _cached_speed: float = 0.0
+    _cached_test_mode: bool = False
+    _cached_prox_beep: bool = False
+
     def select_provider(self, provider_name: str):
         """Select a provider.
         :param provider_name: The name of the provider to select.
@@ -293,66 +301,81 @@ class Plugin(ETS2LAPlugin):
         )  # Reset the settings page to update the provider selection
 
     def init(self):
-        self.load_settings()
+        self.load_settings(force=True)  # Force initial load
 
-    def load_settings(self):
-        self.test_mode = settings.test_mode
-        if self.test_mode is None:
+    def load_settings(self, force: bool = False):
+        # Read current settings values
+        cur_test_mode = settings.test_mode
+        cur_prox_beep = settings.road_proximity_beep
+        cur_provider = settings.provider or "SAPI"
+        cur_voice = settings.voice or "Microsoft Zira Desktop - English (United States)"
+        cur_volume = settings.volume or 0.5
+        cur_speed = settings.speed or 1.0
+
+        # Quick check: if nothing changed and not forced, skip expensive operations
+        if not force and (
+            cur_test_mode == self._cached_test_mode
+            and cur_prox_beep == self._cached_prox_beep
+            and cur_provider == self._cached_provider
+            and cur_voice == self._cached_voice
+            and cur_volume == self._cached_volume
+            and cur_speed == self._cached_speed
+        ):
+            return  # No settings changed, skip reload
+
+        # Update test mode and prox beep
+        self.test_mode = cur_test_mode if cur_test_mode is not None else False
+        if cur_test_mode is None:
             settings.test_mode = False
 
-        self.prox_beep = settings.road_proximity_beep
-        if self.prox_beep is None:
+        self.prox_beep = cur_prox_beep if cur_prox_beep is not None else False
+        if cur_prox_beep is None:
             settings.road_proximity_beep = False
 
-        provider = settings.provider
-        voice = settings.voice
+        # Only switch provider if it actually changed
+        if cur_provider != self._cached_provider or not self.selected_provider:
+            logging.warning(_("Loading TTS provider: {0}").format(cur_provider))
+            self.select_provider(cur_provider)
+            # Force voice reload when provider changes
+            self._cached_voice = ""
 
-        if not provider:
-            provider = "SAPI"
-
-        if not voice:
-            voice = "Microsoft Zira Desktop - English (United States)"
-
-        if not self.selected_provider or self.selected_provider.name != provider:
-            logging.warning(_("Loading TTS provider: {0}").format(provider))
-            self.select_provider(provider)
-            if voice not in [v.name for v in self.selected_provider.voices]:
-                voice = self.selected_provider.voices[0].name
-                settings.voice = voice
+            if cur_voice not in [v.name for v in self.selected_provider.voices]:
+                cur_voice = self.selected_provider.voices[0].name
+                settings.voice = cur_voice
                 logging.warning(
                     _("Voice {0} not found, using default: {1}").format(
-                        voice, self.selected_provider.voices[0].name
+                        cur_voice, self.selected_provider.voices[0].name
                     )
                 )
 
-        if not self.selected_voice or self.selected_voice.name != voice:
-            logging.warning(_("Loading TTS voice: {0}").format(voice))
-            self.select_voice(voice)
+        # Only switch voice if it actually changed
+        if cur_voice != self._cached_voice or not self.selected_voice:
+            logging.warning(_("Loading TTS voice: {0}").format(cur_voice))
+            self.select_voice(cur_voice)
 
+        # Only update volume/speed if they changed
         if self.selected_provider:
-            volume = settings.volume
-            if not volume:
-                volume = 0.5
-                settings.volume = 0.5
-            self.selected_provider.set_volume(volume)
-            try:
-                self.pages[0].reset_timer(
-                    self.pages[0]
-                )  # Reset the settings page to update the volume
-            except Exception:
-                pass
+            if cur_volume != self._cached_volume:
+                self.selected_provider.set_volume(cur_volume)
+                try:
+                    self.pages[0].reset_timer(self.pages[0])
+                except Exception:
+                    pass
 
-            speed = settings.speed
-            if not speed:
-                speed = 1.0
-                settings.speed = 1.0
-            self.selected_provider.set_speed(speed)
-            try:
-                self.pages[0].reset_timer(
-                    self.pages[0]
-                )  # Reset the settings page to update the speed
-            except Exception:
-                pass
+            if cur_speed != self._cached_speed:
+                self.selected_provider.set_speed(cur_speed)
+                try:
+                    self.pages[0].reset_timer(self.pages[0])
+                except Exception:
+                    pass
+
+        # Update cache with current values
+        self._cached_test_mode = cur_test_mode
+        self._cached_prox_beep = cur_prox_beep
+        self._cached_provider = cur_provider
+        self._cached_voice = cur_voice
+        self._cached_volume = cur_volume
+        self._cached_speed = cur_speed
 
     def speak(self, text: str, override_first=False):
         """Speak the given text.
