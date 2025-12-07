@@ -961,11 +961,21 @@ class Plugin(ETS2LAPlugin):
             if lane_change_factor < 1.0:
                 target_speed = target_speed * lane_change_factor
 
-        # Limit speed in toll stations to 25 km/h
+        # Limit speed in toll stations based on curves (30-50 km/h range)
         current_prefab_type = self.tags.current_prefab_type
         current_prefab_type = self.tags.merge(current_prefab_type)
         if current_prefab_type == "toll":
-            toll_speed_limit = 25 / 3.6  # 25 km/h in m/s
+            # Use curve-based speed but clamp to toll-safe range
+            toll_min_speed = 30 / 3.6  # 30 km/h in m/s
+            toll_max_speed = 50 / 3.6  # 50 km/h in m/s
+
+            # Use the already calculated curve-based max speed if available
+            if smoothed_max_speed > 0:
+                toll_speed_limit = min(smoothed_max_speed, toll_max_speed)
+                toll_speed_limit = max(toll_speed_limit, toll_min_speed)
+            else:
+                toll_speed_limit = toll_min_speed  # Fallback to safe minimum
+
             if target_speed > toll_speed_limit:
                 target_speed = toll_speed_limit
 
