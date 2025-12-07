@@ -9,6 +9,7 @@ import numpy as np
 import logging
 import math
 import time
+import os
 
 OFFSET_MULTIPLIER = 1.5
 ANGLE_MULTIPLIER = 1
@@ -33,6 +34,56 @@ _last_steering_time = 0
 # These define max steering change rate at different speeds
 _jerk_limit_low_speed = 300   # degrees/s at low speed (10 kph) - more responsive
 _jerk_limit_high_speed = 100  # degrees/s at high speed (80 kph) - smoother
+
+# Steering lag detection logging (buffered to avoid I/O causing more lag)
+_steering_log_path = os.path.join(os.path.dirname(__file__), "..", "steering_debug.log")
+_steering_last_time = 0
+_steering_frame = 0
+_steering_last_value = 0
+_steering_log_buffer = []
+_steering_log_last_flush = 0
+
+
+def _log_steering_debug(angle: float, route_points_count: int):
+    """Log steering for lag detection. Buffers writes to avoid I/O delays."""
+    global _steering_last_time, _steering_frame, _steering_last_value
+    global _steering_log_buffer, _steering_log_last_flush
+
+    _steering_frame += 1
+    now = time.perf_counter()
+    dt_ms = (now - _steering_last_time) * 1000 if _steering_last_time > 0 else 0
+    _steering_last_time = now
+
+    # Detect issues
+    flags = []
+    if dt_ms > 200:
+        flags.append("SERIOUS_LAG")
+    elif dt_ms > 100:
+        flags.append("MISSED_FRAME")
+    if abs(angle) < 0.01 and route_points_count > 5 and abs(_steering_last_value) > 0.1:
+        flags.append("ZERO_SUSPICIOUS")
+
+    _steering_last_value = angle
+
+    # Buffer log entries instead of immediate file write
+    if flags:
+        timestamp = time.strftime("%H:%M:%S")
+        speed_kph = data.truck_speed * 3.6
+        _steering_log_buffer.append(
+            f"[{timestamp}] frame={_steering_frame} dt={dt_ms:.0f}ms "
+            f"angle={angle:.2f} points={route_points_count} speed={speed_kph:.0f}kph "
+            f"{' '.join(flags)}\n"
+        )
+
+    # Flush buffer every 5 seconds instead of every frame
+    if now - _steering_log_last_flush > 5.0 and _steering_log_buffer:
+        _steering_log_last_flush = now
+        try:
+            with open(_steering_log_path, "a") as f:
+                f.writelines(_steering_log_buffer)
+            _steering_log_buffer.clear()
+        except:
+            pass
 
 
 def _get_jerk_limit(speed_kph: float) -> float:
@@ -308,6 +359,7 @@ def GetSteering():
             return 0
 
     points = []
+    seen_points = set()  # O(1) lookup for deduplication
     for section in data.route_plan:
         if len(points) > data.amount_of_points:
             break
@@ -321,6 +373,8 @@ def GetSteering():
                 break
 
             if len(points) == 0:
+                point_key = (round(point.x, 1), round(point.z, 1))
+                seen_points.add(point_key)
                 points.append(point)
                 continue
 
@@ -329,15 +383,19 @@ def GetSteering():
             )
             if distance >= GetPointDistance(len(points), data.amount_of_points):
                 if distance <= 20:
-                    if point not in points:
+                    point_key = (round(point.x, 1), round(point.z, 1))
+                    if point_key not in seen_points:
+                        seen_points.add(point_key)
                         points.append(point)
 
     if len(points) == 0:
         # During route recalculation, use backup points instead of returning 0
         if data.route_recalculating and len(data.route_points_backup) > 5:
             data.route_points = data.route_points_backup.copy()
+            _log_steering_debug(0, 0)  # Log zero points case
             return _last_steering_value if _last_steering_value != 0 else 0
         data.route_points = []
+        _log_steering_debug(0, 0)  # Log zero points case
         return 0
 
     first_distance = math_helpers.DistanceBetweenPoints(
@@ -492,6 +550,9 @@ def GetSteering():
         # Apply jerk limiting for smooth, humanlike steering
         speed_kph = data.truck_speed * 3.6
         smoothed_steering = _apply_jerk_limiting(raw_steering, speed_kph)
+
+        # Log for steering lag detection
+        _log_steering_debug(smoothed_steering, len(points))
 
         return smoothed_steering
     except Exception:

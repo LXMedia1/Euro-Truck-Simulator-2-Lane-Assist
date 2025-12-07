@@ -22,6 +22,38 @@ import traceback
 import logging
 import math
 import time
+import os
+
+# Brake debug logging (buffered to avoid I/O delays)
+_brake_log_path = os.path.join(os.path.dirname(__file__), "brake_debug.log")
+_brake_log_buffer = []
+_brake_log_last_flush = 0
+_brake_last_state = None  # Track state changes: "THROTTLE", "COAST", "BRAKE"
+
+def _log_brake_debug(state: str, speed_kph: float, limit_kph: float, target_accel: float, brake_output: float, reason: str = ""):
+    """Log brake/throttle/coast decisions for debugging jerky behavior."""
+    global _brake_log_buffer, _brake_log_last_flush, _brake_last_state
+
+    now = time.perf_counter()
+
+    # Only log on state changes or when braking (to keep log manageable)
+    if state != _brake_last_state or state == "BRAKE":
+        timestamp = time.strftime("%H:%M:%S")
+        _brake_log_buffer.append(
+            f"[{timestamp}] {state}: speed={speed_kph:.1f}kph limit={limit_kph:.1f}kph "
+            f"target_accel={target_accel:.3f} brake={brake_output:.3f} {reason}\n"
+        )
+        _brake_last_state = state
+
+    # Flush every 3 seconds
+    if now - _brake_log_last_flush > 3.0 and _brake_log_buffer:
+        _brake_log_last_flush = now
+        try:
+            with open(_brake_log_path, "a") as f:
+                f.writelines(_brake_log_buffer)
+            _brake_log_buffer.clear()
+        except:
+            pass
 
 
 class ACCVehicle(Vehicle):
@@ -142,6 +174,10 @@ class Plugin(ETS2LAPlugin):
     is_coasting = False
     coast_hysteresis = 0.05      # prevents oscillation between states
 
+    # Brake smoothing for constant pressure instead of jerky on/off
+    last_brake_output = 0.0
+    brake_smoothing_factor = 0.25  # Lower = smoother (0.25 = gradual brake pressure)
+
     # PID gains
     kp_accel = 0.30  # Proportional gain
     ki_accel = 0.08  # Integral gain
@@ -192,13 +228,13 @@ class Plugin(ETS2LAPlugin):
         speed_error_kph = speed_error * 3.6
         self.add_ar_text(f" - Error: {speed_error_kph:.1f} kph")
 
-        # Speed tolerance zone: reduce corrections when near target speed
-        # This enables coasting behavior for fuel efficiency
-        tolerance_ms = self.speed_tolerance / 3.6  # Convert km/h to m/s
+        # Speed tolerance zone: 10% of speed limit for smooth cruising
+        # At 80 km/h limit: tolerance is 8 km/h (72-88 km/h)
+        tolerance_ms = self.speedlimit * 0.10  # 10% of limit in m/s
         if abs(speed_error) < tolerance_ms:
-            # Within tolerance - scale down the correction proportionally
+            # Within tolerance - very gentle corrections
             scale = abs(speed_error) / tolerance_ms
-            speed_limit_accel = speed_error * 0.5 * scale * 0.5
+            speed_limit_accel = speed_error * 0.3 * scale * scale  # Quadratic falloff
             self.add_ar_text(f" - In tolerance zone (scale: {scale:.2f})")
         else:
             speed_limit_accel = speed_error * 0.5
@@ -214,11 +250,12 @@ class Plugin(ETS2LAPlugin):
                 self.max_accel, max(self.comfort_decel, speed_limit_accel)
             )
 
-        if self.speed < self.speedlimit + 5 / 3.6:
-            speed_limit_accel *= 0.75
-
-        if self.speed > self.speedlimit + 10 / 3.6:
-            speed_limit_accel *= 1.5
+        # Only apply stronger braking when significantly over limit (10%+)
+        overspeed_threshold = self.speedlimit * 0.10  # 10% of limit
+        if self.speed > self.speedlimit + overspeed_threshold:
+            # Proportional braking based on how much over the threshold
+            overspeed_factor = (self.speed - self.speedlimit - overspeed_threshold) / overspeed_threshold
+            speed_limit_accel *= (1 + 0.5 * min(overspeed_factor, 1.0))
 
         self.add_ar_text(f" - Filtered Accel: {speed_limit_accel:.2f} m/s²")
         return speed_limit_accel
@@ -411,24 +448,25 @@ class Plugin(ETS2LAPlugin):
         traffic_light: ACCTrafficLight | None = None,
         gate: ACCGate | None = None,
         stop_in: float | None = None,
-    ) -> float:
-        target_accelerations = []
+    ) -> tuple[float, str]:
+        """Returns (target_acceleration, reason_string)"""
+        target_accelerations = []  # List of (accel, reason) tuples
 
         # Speed Limit
         speed_limit_accel = self.calculate_speedlimit_constraint()
-        target_accelerations.append(speed_limit_accel)
+        target_accelerations.append((speed_limit_accel, "speed_limit"))
 
         # Leading Vehicle
         if in_front is not None:
             following_accel = self.calculate_leading_vehicle_constraint(in_front)
-            target_accelerations.append(following_accel)
+            target_accelerations.append((following_accel, f"vehicle({in_front.distance:.0f}m)"))
 
         # Stop in - Works the same as traffic lights, just stops at that distance.
         if stop_in is not None and stop_in > 0:
             stop_in_accel = self.calculate_traffic_light_constraint(
                 stop_in, allow_acceleration=True
             )
-            target_accelerations.append(stop_in_accel)
+            target_accelerations.append((stop_in_accel, f"stop_in({stop_in:.0f}m)"))
 
         # Red Light - Only check if traffic lights are not ignored
         if traffic_light and not settings.ignore_traffic_lights:
@@ -438,24 +476,25 @@ class Plugin(ETS2LAPlugin):
                 red_light_accel = self.calculate_traffic_light_constraint(
                     traffic_light.distance
                 )
-                target_accelerations.append(red_light_accel)
+                target_accelerations.append((red_light_accel, f"red_light({traffic_light.distance:.0f}m)"))
 
         # Gate
         if gate and not settings.ignore_gates:
             if gate.state < 3:  # Closing, closed or opening
                 # Logic is the same as the traffic lights
                 gate_accel = self.calculate_traffic_light_constraint(gate.distance)
-                target_accelerations.append(gate_accel)
+                target_accelerations.append((gate_accel, f"gate({gate.distance:.0f}m)"))
 
         # Take most restrictive (minimum)
         if target_accelerations:
+            min_accel, reason = min(target_accelerations, key=lambda x: x[0])
             self.add_ar_text("")
-            self.add_ar_text(f"Target Accel: {min(target_accelerations):.2f} m/s²")
+            self.add_ar_text(f"Target Accel: {min_accel:.2f} m/s² ({reason})")
             self.add_ar_text("")
-            return min(target_accelerations)
+            return min_accel, reason
         else:
             # Maintain speed
-            return 0.0
+            return 0.0, "none"
 
     def init(self):
         self.api = self.modules.TruckSimAPI
@@ -1022,7 +1061,7 @@ class Plugin(ETS2LAPlugin):
 
     set_zero = False
 
-    def set_accel_brake(self, accel: float) -> None:
+    def set_accel_brake(self, accel: float, reason: str = "") -> None:
         is_reversing = False
         clutch = 0.0
         speed = 0.0
@@ -1084,7 +1123,9 @@ class Plugin(ETS2LAPlugin):
             self.is_coasting = True
             self.controller.aforward = float(0)
             self.controller.abackward = float(0)
+            self.last_brake_output = 0.0  # Reset brake smoothing
             self.set_zero = True
+            _log_brake_debug("COAST", self.speed * 3.6, self.speedlimit * 3.6, target_accel, 0.0, reason)
         elif target_accel > 0:
             # THROTTLE: Need to accelerate
             self.is_coasting = False
@@ -1097,15 +1138,25 @@ class Plugin(ETS2LAPlugin):
 
             if self.speed > 10 / 3.6 and not self.set_zero:
                 self.controller.abackward = float(0)
+                self.last_brake_output = 0.0  # Reset brake smoothing
                 self.set_zero = True
             elif not self.set_zero:
                 self.controller.abackward = float(0.0001)
+            _log_brake_debug("THROTTLE", self.speed * 3.6, self.speedlimit * 3.6, target_accel, 0.0, reason)
         else:
             # BRAKE: Need to decelerate more than coasting provides
             self.is_coasting = False
             self.set_zero = False
-            self.controller.abackward = float(-target_accel)
+            # Smooth brake output for constant pressure instead of jerky on/off
+            desired_brake = float(-target_accel)
+            smoothed_brake = self.last_brake_output + self.brake_smoothing_factor * (desired_brake - self.last_brake_output)
+            self.last_brake_output = smoothed_brake
+            self.controller.abackward = smoothed_brake
             self.controller.aforward = float(0)
+            # Log every brake action to see oscillation pattern
+            over_limit = (self.speed * 3.6) - (self.speedlimit * 3.6)
+            _log_brake_debug("BRAKE", self.speed * 3.6, self.speedlimit * 3.6, target_accel, smoothed_brake,
+                           f"{reason} over={over_limit:+.1f}kph")
 
     def apply_pid(self, target_acceleration: float) -> float:
         """Apply PID control to get smooth accelerator/brake inputs based on target acceleration.
@@ -1344,11 +1395,11 @@ class Plugin(ETS2LAPlugin):
                 if isinstance(value, (int, float)) and value > 0:
                     stop_in = min(stop_in, value)
 
-        target_acceleration = self.calculate_target_acceleration(
+        target_acceleration, accel_reason = self.calculate_target_acceleration(
             in_front, traffic_light, gate, stop_in
         )
         target_throttle = self.apply_pid(target_acceleration)
-        self.set_accel_brake(target_throttle)
+        self.set_accel_brake(target_throttle, accel_reason)
 
         self.tags.acc = self.speedlimit
         self.tags.acc_target = target_acceleration
