@@ -22,6 +22,13 @@ _lane_change_cooldown = 2.0  # seconds
 # Rate limiting for warnings
 _last_far_point_warning = 0
 
+# Path re-acquisition smoothing
+_was_path_lost = True  # Start as True so first path acquisition is also smoothed
+_path_reacquire_time = 0
+_path_reacquire_ramp_duration = 2.0  # seconds to ramp up steering after re-acquiring path
+_last_steering_value = 0
+_max_steering_change_rate = 150  # max degrees per second change in steering (only for large corrections)
+
 
 def get_closest_route_item(items: list[rc.RouteItem]):
     in_bounding_box = []
@@ -227,12 +234,16 @@ def LerpTrailerAndTruck(start_speed=30, end_speed=70) -> list[float]:
 
 
 def GetSteering():
+    global _was_path_lost, _path_reacquire_time, _last_steering_value, _last_far_point_warning
+
     if len(data.route_plan) == 0:
         if data.enabled and data.takeover_when_unreliable:
             events.trigger("takeover", Event())
             data.plugin.notify("Takeover: Lost route tracking, please drive manually")
 
         data.route_points = []
+        _was_path_lost = True
+        _last_steering_value = 0
         return 0
 
     if not data.use_navigation or len(data.navigation_plan) == 0:
@@ -241,6 +252,8 @@ def GetSteering():
         # Fix issue: Default steering to 0 when passing a Prefab and navigation is not calculated
         if isinstance(data.route_plan[0].items[0].item, c.Prefab):
             # logging.warning("Navigation not calculated, defaulting steering to 0.")
+            _was_path_lost = True
+            _last_steering_value = 0
             return 0
 
     points = []
@@ -283,7 +296,6 @@ def GetSteering():
     # Only trigger takeover if genuinely lost (both points > 15m away)
     min_distance = min(first_distance, last_distance)
     if min_distance > 10:
-        global _last_far_point_warning
         current_time = time.perf_counter()
         if current_time - _last_far_point_warning > 5:  # Only log every 5 seconds
             logging.warning(f"Route points too far away ({min_distance:.1f}m), ignoring steering.")
@@ -292,6 +304,8 @@ def GetSteering():
             events.trigger("takeover", Event())
             data.plugin.notify("Takeover: Steering unreliable")
         data.route_points = points
+        _was_path_lost = True
+        _last_steering_value = 0
         return 0
 
     points = points
@@ -375,7 +389,7 @@ def GetSteering():
             else:
                 angle += offset_correction * OFFSET_MULTIPLIER
 
-            return angle * multiplier
+            raw_steering = angle * multiplier
         elif len(points) == 2:
             x = points[len(points) - 1].x
             z = points[len(points) - 1].z
@@ -395,9 +409,35 @@ def GetSteering():
             if np.cross(forward_vector, vector) < 0:
                 angle = -angle
 
-            return angle * 2 * multiplier
+            raw_steering = angle * 2 * multiplier
         else:
+            _was_path_lost = False
+            _last_steering_value = 0
             return 0
+
+        # Apply smoothing when re-acquiring the path after it was lost
+        current_time = time.perf_counter()
+        if _was_path_lost:
+            _was_path_lost = False
+            _path_reacquire_time = current_time
+            logging.info("Path re-acquired, applying smooth transition")
+
+        # Ramp up steering gradually after path re-acquisition
+        time_since_reacquire = current_time - _path_reacquire_time
+        if time_since_reacquire < _path_reacquire_ramp_duration:
+            # Use smooth easing (ease-in-out for smoother approach)
+            ramp_factor = time_since_reacquire / _path_reacquire_ramp_duration
+            # Ease-in-out: smooth start and smooth finish
+            if ramp_factor < 0.5:
+                ramp_factor = 2 * ramp_factor * ramp_factor
+            else:
+                ramp_factor = 1 - pow(-2 * ramp_factor + 2, 2) / 2
+            raw_steering = raw_steering * ramp_factor
+
+        _last_steering_value = raw_steering
+        return raw_steering
     except Exception:
         logging.exception("Error in GetSteering")
+        _was_path_lost = True
+        _last_steering_value = 0
         return 0
