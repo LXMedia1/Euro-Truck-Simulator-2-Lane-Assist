@@ -272,13 +272,18 @@ def GetNextRouteSection(route: list[rc.RouteSection] = None) -> rc.RouteSection:
                 next_item.nav_routes[lane_id].points[-1].tuple()
                 for lane_id in closest_lane_ids
             ]
-            direction = (
-                "left"
-                if data.truck_indicating_left
-                else "right"
-                if data.truck_indicating_right
-                else "straight"
-            )
+
+            # For toll stations, prefer the rightmost lane
+            if next_item.is_toll:
+                direction = "right"
+            else:
+                direction = (
+                    "left"
+                    if data.truck_indicating_left
+                    else "right"
+                    if data.truck_indicating_right
+                    else "straight"
+                )
             best_lane = math_helpers.GetMostInDirection(
                 end_positions,
                 data.truck_rotation,
@@ -633,6 +638,22 @@ def GetNextNavigationItem():
         accepted_lanes = [lane for lane in accepted_lanes if 0 <= lane <= max_lane_index]
         if not accepted_lanes:
             return None  # No valid lanes to navigate
+
+        # For toll stations, prefer the rightmost lane
+        if next_item.is_toll and len(accepted_lanes) > 1:
+            end_positions = [
+                next_item.nav_routes[lane].points[-1].tuple()
+                for lane in accepted_lanes
+            ]
+            rightmost_idx = math_helpers.GetMostInDirection(
+                end_positions,
+                data.truck_rotation,
+                (data.truck_x, data.truck_y, data.truck_z),
+                direction="right",
+            )
+            best_lane = accepted_lanes[rightmost_idx]
+            return PrefabToRouteSection(next_item, best_lane, path_index=index)
+
         best_lane = math.inf
         best_distance = math.inf
         best_length = math.inf
